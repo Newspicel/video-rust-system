@@ -1,0 +1,10 @@
+[package]
+name = "vrs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = "0.8.4"
+ffmpeg-next = "8.0.0"
+serde = { version = "1.0.225", features = ["derive"] }
+tokio = { version = "1.47.1", features = ["full"] }
