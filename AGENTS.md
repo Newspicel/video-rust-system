@@ -4,6 +4,7 @@
 - `src/` holds Rust application code; `src/main.rs` currently exposes the CLI entry point via `main()`. Add new modules with `mod` declarations at the top of `main.rs` or factor them into `src/<feature>.rs` and reference them in `lib.rs` when introduced.
 - `target/` is Cargo’s build output; do not commit it. Create a `tests/` directory for integration tests when the surface expands.
 - Keep configuration (e.g., `.cargo/`, `configs/`) grouped by concern; document new directories in this guide.
+- `data/libs/` caches external executables fetched at runtime (e.g., `yt-dlp`, `ffmpeg`); it is created automatically by the server when needed.
 
 ## Build, Test, and Development Commands
 - `cargo run` – compile in debug mode and execute the binary for quick feedback.
