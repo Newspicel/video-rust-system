@@ -1,21 +1,16 @@
-mod cleanup;
-mod error;
-mod handlers;
-mod jobs;
-mod state;
-mod storage;
-mod transcode;
-
 use std::{env, net::SocketAddr, sync::Arc};
 
 use axum::{
     Router,
     routing::{get, post},
 };
-use cleanup::CleanupConfig;
-use jobs::{DynJobStore, LocalJobStore};
-use state::AppState;
-use storage::Storage;
+use vrs::{
+    cleanup::CleanupConfig,
+    handlers,
+    jobs::{DynJobStore, LocalJobStore},
+    state::AppState,
+    storage::Storage,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
