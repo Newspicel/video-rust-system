@@ -13,6 +13,7 @@ use crate::error::AppError;
 #[async_trait]
 pub trait JobStore: Send + Sync {
     async fn create_job(&self, id: Uuid) -> Result<(), AppError>;
+    async fn set_plan(&self, id: Uuid, plan: Vec<JobStage>) -> Result<(), AppError>;
     async fn update_stage(&self, id: Uuid, stage: JobStage) -> Result<(), AppError>;
     async fn update_progress(&self, id: Uuid, progress: f32) -> Result<(), AppError>;
     async fn fail(&self, id: Uuid, error: String) -> Result<(), AppError>;
@@ -42,37 +43,38 @@ impl JobStore for LocalJobStore {
         Ok(())
     }
 
+    async fn set_plan(&self, id: Uuid, plan: Vec<JobStage>) -> Result<(), AppError> {
+        let mut guard = self.inner.lock().await;
+        if let Some(record) = guard.get_mut(&id) {
+            record.set_plan(plan);
+        }
+        Ok(())
+    }
+
     async fn update_stage(&self, id: Uuid, stage: JobStage) -> Result<(), AppError> {
         if let Some(record) = self.inner.lock().await.get_mut(&id) {
-            record.stage = stage;
-            record.touch();
+            record.set_stage(stage);
         }
         Ok(())
     }
 
     async fn update_progress(&self, id: Uuid, progress: f32) -> Result<(), AppError> {
         if let Some(record) = self.inner.lock().await.get_mut(&id) {
-            record.progress = progress.clamp(0.0, 1.0);
-            record.touch();
+            record.set_stage_progress(progress);
         }
         Ok(())
     }
 
     async fn fail(&self, id: Uuid, error: String) -> Result<(), AppError> {
         if let Some(record) = self.inner.lock().await.get_mut(&id) {
-            record.stage = JobStage::Failed;
-            record.error = Some(error);
-            record.progress = record.progress.max(0.0);
-            record.touch();
+            record.fail(error);
         }
         Ok(())
     }
 
     async fn complete(&self, id: Uuid) -> Result<(), AppError> {
         if let Some(record) = self.inner.lock().await.get_mut(&id) {
-            record.stage = JobStage::Complete;
-            record.progress = 1.0;
-            record.touch();
+            record.complete();
         }
         Ok(())
     }
@@ -95,12 +97,13 @@ pub type DynJobStore = Arc<dyn JobStore>;
 
 struct JobRecord {
     stage: JobStage,
-    progress: f32,
+    stage_progress: f32,
     started_at_instant: Instant,
     last_update_instant: Instant,
     started_at_system: SystemTime,
     last_update_system: SystemTime,
     error: Option<String>,
+    plan: Vec<JobStage>,
 }
 
 impl JobRecord {
@@ -109,13 +112,42 @@ impl JobRecord {
         let now_system = SystemTime::now();
         Self {
             stage: JobStage::Queued,
-            progress: 0.0,
+            stage_progress: 0.0,
             started_at_instant: now_instant,
             last_update_instant: now_instant,
             started_at_system: now_system,
             last_update_system: now_system,
             error: None,
+            plan: Vec::new(),
         }
+    }
+
+    fn set_plan(&mut self, plan: Vec<JobStage>) {
+        self.plan = plan;
+        self.touch();
+    }
+
+    fn set_stage(&mut self, stage: JobStage) {
+        self.stage = stage;
+        self.stage_progress = 0.0;
+        self.touch();
+    }
+
+    fn set_stage_progress(&mut self, progress: f32) {
+        self.stage_progress = progress.clamp(0.0, 1.0);
+        self.touch();
+    }
+
+    fn fail(&mut self, error: String) {
+        self.stage = JobStage::Failed;
+        self.error = Some(error);
+        self.touch();
+    }
+
+    fn complete(&mut self) {
+        self.stage = JobStage::Complete;
+        self.stage_progress = 1.0;
+        self.touch();
     }
 
     fn touch(&mut self) {
@@ -129,10 +161,13 @@ impl JobRecord {
             .duration_since(self.started_at_instant);
         let elapsed_seconds = elapsed.as_secs_f64();
 
-        let estimated_remaining_seconds = if self.progress >= 1.0 {
+        let (overall_progress, stage_progress, stage_index, total_stages) =
+            self.compute_progress_metrics();
+
+        let estimated_remaining_seconds = if overall_progress >= 1.0 {
             Some(0.0)
-        } else if self.progress > 0.0 {
-            let total_estimated = elapsed_seconds / self.progress as f64;
+        } else if overall_progress > 0.0 {
+            let total_estimated = elapsed_seconds / overall_progress as f64;
             Some((total_estimated - elapsed_seconds).max(0.0))
         } else {
             None
@@ -141,12 +176,71 @@ impl JobRecord {
         JobStatusResponse {
             id,
             stage: self.stage,
-            progress: self.progress,
+            progress: overall_progress,
+            stage_progress: stage_progress,
+            current_stage_index: stage_index,
+            total_stages,
             elapsed_seconds,
             estimated_remaining_seconds,
             error: self.error.clone(),
             started_at_unix_ms: millis_since_epoch(self.started_at_system),
             last_update_unix_ms: millis_since_epoch(self.last_update_system),
+        }
+    }
+
+    fn compute_progress_metrics(&self) -> (f32, f32, Option<u32>, u32) {
+        if self.stage == JobStage::Complete {
+            return (
+                1.0,
+                1.0,
+                Some(self.plan.len() as u32),
+                self.plan.len() as u32,
+            );
+        }
+
+        let total_stages = self.plan.len() as f32;
+
+        if total_stages == 0.0 {
+            let stage_progress = if matches!(self.stage, JobStage::Failed) {
+                self.stage_progress.min(1.0)
+            } else {
+                self.stage_progress
+            };
+            return (stage_progress, stage_progress, None, 0);
+        }
+
+        let stage_index = self.plan.iter().position(|stage| *stage == self.stage);
+        match stage_index {
+            Some(idx) => {
+                let completed = idx as f32;
+                let clamped_stage = self.stage_progress.clamp(0.0, 1.0);
+                let overall = ((completed + clamped_stage) / total_stages).clamp(0.0, 1.0);
+                (
+                    overall,
+                    clamped_stage,
+                    Some((idx + 1) as u32),
+                    self.plan.len() as u32,
+                )
+            }
+            None => {
+                let overall = match self.stage {
+                    JobStage::Failed => self.stage_progress.clamp(0.0, 1.0),
+                    JobStage::Queued => 0.0,
+                    JobStage::Uploading | JobStage::Downloading | JobStage::Transcoding => {
+                        (self.stage_progress / total_stages).clamp(0.0, 1.0)
+                    }
+                    JobStage::Finalizing => {
+                        ((total_stages - 1.0 + self.stage_progress) / total_stages).clamp(0.0, 1.0)
+                    }
+                    JobStage::Complete => 1.0,
+                };
+                (
+                    overall,
+                    self.stage_progress.clamp(0.0, 1.0),
+                    None,
+                    self.plan.len() as u32,
+                )
+            }
         }
     }
 }
@@ -175,6 +269,9 @@ pub struct JobStatusResponse {
     pub id: Uuid,
     pub stage: JobStage,
     pub progress: f32,
+    pub stage_progress: f32,
+    pub current_stage_index: Option<u32>,
+    pub total_stages: u32,
     pub elapsed_seconds: f64,
     pub estimated_remaining_seconds: Option<f64>,
     pub error: Option<String>,

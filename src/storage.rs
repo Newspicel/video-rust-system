@@ -1,4 +1,5 @@
 use std::{
+    env,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -15,33 +16,47 @@ pub struct Storage {
 struct StorageInner {
     root_dir: PathBuf,
     videos_dir: PathBuf,
-    tmp_dir: PathBuf,
     libs_dir: PathBuf,
+    tmp_root: PathBuf,
+    tmp_incoming_dir: PathBuf,
+    tmp_hls_dir: PathBuf,
+    tmp_dash_dir: PathBuf,
 }
 
 impl Storage {
     pub async fn initialize(root: impl AsRef<Path>) -> Result<Self, AppError> {
         let root = root.as_ref().to_path_buf();
         let videos_dir = root.join("videos");
-        let tmp_dir = root.join("tmp");
         let libs_dir = root.join("libs");
+        let tmp_root = env::temp_dir().join("vrs");
+        let tmp_incoming_dir = tmp_root.join("incoming");
+        let tmp_hls_dir = tmp_root.join("hls");
+        let tmp_dash_dir = tmp_root.join("dash");
 
         ensure_dir(&videos_dir).await?;
-        ensure_dir(&tmp_dir).await?;
         ensure_dir(&libs_dir).await?;
+        ensure_dir(&tmp_root).await?;
+        ensure_dir(&tmp_incoming_dir).await?;
+        ensure_dir(&tmp_hls_dir).await?;
+        ensure_dir(&tmp_dash_dir).await?;
 
         Ok(Self {
             inner: Arc::new(StorageInner {
                 root_dir: root,
                 videos_dir,
-                tmp_dir,
                 libs_dir,
+                tmp_root,
+                tmp_incoming_dir,
+                tmp_hls_dir,
+                tmp_dash_dir,
             }),
         })
     }
 
     pub fn incoming_path(&self, id: &uuid::Uuid) -> PathBuf {
-        self.inner.tmp_dir.join(format!("{}.incoming", id.simple()))
+        self.inner
+            .tmp_incoming_dir
+            .join(format!("{}.incoming", id.simple()))
     }
 
     pub fn video_dir(&self, id: &uuid::Uuid) -> PathBuf {
@@ -53,15 +68,15 @@ impl Storage {
     }
 
     pub fn hls_dir(&self, id: &uuid::Uuid) -> PathBuf {
-        self.video_dir(id).join("hls")
+        self.inner.tmp_hls_dir.join(id.hyphenated().to_string())
     }
 
     pub fn dash_dir(&self, id: &uuid::Uuid) -> PathBuf {
-        self.video_dir(id).join("dash")
+        self.inner.tmp_dash_dir.join(id.hyphenated().to_string())
     }
 
     pub fn tmp_dir(&self) -> PathBuf {
-        self.inner.tmp_dir.clone()
+        self.inner.tmp_root.clone()
     }
 
     pub fn libs_dir(&self) -> PathBuf {
@@ -98,19 +113,10 @@ impl Storage {
     pub async fn prepare_video_dirs(
         &self,
         id: &uuid::Uuid,
-        rendition_names: &[&str],
+        _rendition_names: &[&str],
     ) -> Result<(), AppError> {
         let video_dir = self.video_dir(id);
         ensure_dir(&video_dir).await?;
-
-        let hls_dir = self.hls_dir(id);
-        ensure_dir(&hls_dir).await?;
-        for name in rendition_names {
-            ensure_dir(&hls_dir.join(name)).await?;
-        }
-
-        let dash_dir = self.dash_dir(id);
-        ensure_dir(&dash_dir).await?;
 
         Ok(())
     }

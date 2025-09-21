@@ -21,7 +21,7 @@ use crate::{
     jobs::{JobStage, JobStatusResponse},
     state::AppState,
     storage::{ensure_dir, ensure_parent},
-    transcode::process_video,
+    transcode::{EncodeParams, ensure_dash_ready, ensure_hls_ready, process_video},
 };
 
 #[derive(Debug, serde::Serialize)]
@@ -33,14 +33,38 @@ pub struct UploadResponse {
     pub dash_manifest_url: String,
 }
 
+#[derive(Debug, Deserialize, Clone, Copy, Default)]
+pub struct ClientTranscodeOptions {
+    pub crf: Option<u8>,
+    #[serde(default, rename = "cpu_used")]
+    pub cpu_used: Option<u8>,
+}
+
+impl From<ClientTranscodeOptions> for EncodeParams {
+    fn from(options: ClientTranscodeOptions) -> Self {
+        let mut params = EncodeParams::default();
+        if let Some(crf) = options.crf {
+            params.crf = crf;
+        }
+        if let Some(cpu) = options.cpu_used {
+            params.cpu_used = cpu;
+        }
+        params.sanitized()
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RemoteUploadRequest {
     pub url: String,
+    #[serde(default)]
+    pub transcode: Option<ClientTranscodeOptions>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct YtDlpDownloadRequest {
     pub url: String,
+    #[serde(default)]
+    pub transcode: Option<ClientTranscodeOptions>,
 }
 
 pub async fn upload_multipart(
@@ -54,8 +78,11 @@ pub async fn upload_multipart(
 
         let id = Uuid::new_v4();
         state.jobs.create_job(id).await?;
+        state
+            .jobs
+            .set_plan(id, vec![JobStage::Uploading, JobStage::Transcoding])
+            .await?;
         state.jobs.update_stage(id, JobStage::Uploading).await?;
-        state.jobs.update_progress(id, START_PROGRESS).await?;
         let temp_path = state.storage.incoming_path(&id);
         ensure_parent(&temp_path).await?;
 
@@ -65,7 +92,7 @@ pub async fn upload_multipart(
         }
         file.flush().await?;
 
-        state.jobs.update_progress(id, UPLOAD_PROGRESS_END).await?;
+        state.jobs.update_progress(id, 1.0).await?;
         spawn_local_pipeline(state.clone(), id, temp_path);
         return Ok(Json(build_upload_response(id)));
     }
@@ -79,13 +106,17 @@ pub async fn upload_remote(
 ) -> Result<Json<UploadResponse>, AppError> {
     let url = Url::parse(&payload.url)
         .map_err(|err| AppError::validation(format!("invalid url: {err}")))?;
+    let encode = payload.transcode.map(EncodeParams::from);
     let id = Uuid::new_v4();
     state.jobs.create_job(id).await?;
-    state.jobs.update_progress(id, START_PROGRESS).await?;
+    state
+        .jobs
+        .set_plan(id, vec![JobStage::Downloading, JobStage::Transcoding])
+        .await?;
 
     let state_for_task = state.clone();
     let url_string: String = url.into();
-    spawn_remote_pipeline(state_for_task, id, url_string);
+    spawn_remote_pipeline(state_for_task, id, url_string, encode);
 
     Ok(Json(build_upload_response(id)))
 }
@@ -96,13 +127,17 @@ pub async fn download_via_ytdlp(
 ) -> Result<Json<UploadResponse>, AppError> {
     let url = Url::parse(&payload.url)
         .map_err(|err| AppError::validation(format!("invalid url: {err}")))?;
+    let encode = payload.transcode.map(EncodeParams::from);
     let id = Uuid::new_v4();
     state.jobs.create_job(id).await?;
-    state.jobs.update_progress(id, START_PROGRESS).await?;
+    state
+        .jobs
+        .set_plan(id, vec![JobStage::Downloading, JobStage::Transcoding])
+        .await?;
 
     let state_for_task = state.clone();
     let url_string: String = url.into();
-    spawn_ytdlp_pipeline(state_for_task, id, url_string);
+    spawn_ytdlp_pipeline(state_for_task, id, url_string, encode);
 
     Ok(Json(build_upload_response(id)))
 }
@@ -125,6 +160,7 @@ pub async fn get_hls_asset(
     let video_id =
         Uuid::parse_str(&id).map_err(|_| AppError::validation("invalid video identifier"))?;
     validate_relative_path(&asset)?;
+    ensure_hls_ready(&state.storage, &video_id).await?;
     let path = state.storage.hls_dir(&video_id).join(asset);
     serve_static_file(path).await
 }
@@ -136,6 +172,7 @@ pub async fn get_dash_asset(
     let video_id =
         Uuid::parse_str(&id).map_err(|_| AppError::validation("invalid video identifier"))?;
     validate_relative_path(&asset)?;
+    ensure_dash_ready(&state.storage, &video_id).await?;
     let path = state.storage.dash_dir(&video_id).join(asset);
     serve_static_file(path).await
 }
@@ -349,10 +386,6 @@ fn validate_relative_path(path: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-const DOWNLOAD_PROGRESS_END: f32 = 0.4;
-const UPLOAD_PROGRESS_END: f32 = 0.35;
-const START_PROGRESS: f32 = 0.05;
-
 fn spawn_local_pipeline(state: AppState, id: Uuid, temp_path: PathBuf) {
     tokio::spawn(async move {
         if let Err(err) = run_local_pipeline(state.clone(), id, temp_path.clone()).await {
@@ -369,9 +402,9 @@ fn spawn_local_pipeline(state: AppState, id: Uuid, temp_path: PathBuf) {
     });
 }
 
-fn spawn_remote_pipeline(state: AppState, id: Uuid, url: String) {
+fn spawn_remote_pipeline(state: AppState, id: Uuid, url: String, encode: Option<EncodeParams>) {
     tokio::spawn(async move {
-        if let Err(err) = run_remote_pipeline(state.clone(), id, url.clone()).await {
+        if let Err(err) = run_remote_pipeline(state.clone(), id, url.clone(), encode).await {
             tracing::error!(%id, url, error = %err, "remote processing failed");
             if let Err(store_err) = state.jobs.fail(id, err.to_string()).await {
                 tracing::error!(%id, url, error = %store_err, "failed to mark remote job failure");
@@ -380,9 +413,9 @@ fn spawn_remote_pipeline(state: AppState, id: Uuid, url: String) {
     });
 }
 
-fn spawn_ytdlp_pipeline(state: AppState, id: Uuid, url: String) {
+fn spawn_ytdlp_pipeline(state: AppState, id: Uuid, url: String, encode: Option<EncodeParams>) {
     tokio::spawn(async move {
-        if let Err(err) = run_ytdlp_pipeline(state.clone(), id, url.clone()).await {
+        if let Err(err) = run_ytdlp_pipeline(state.clone(), id, url.clone(), encode).await {
             tracing::error!(%id, url, error = %err, "yt-dlp processing failed");
             if let Err(store_err) = state.jobs.fail(id, err.to_string()).await {
                 tracing::error!(%id, url, error = %store_err, "failed to mark yt-dlp job failure");
@@ -394,21 +427,20 @@ fn spawn_ytdlp_pipeline(state: AppState, id: Uuid, url: String) {
 async fn run_local_pipeline(state: AppState, id: Uuid, temp_path: PathBuf) -> Result<(), AppError> {
     cleanup::ensure_capacity(&state.storage, &state.jobs, &state.cleanup).await?;
     state.jobs.update_stage(id, JobStage::Transcoding).await?;
-    state
-        .jobs
-        .update_progress(id, DOWNLOAD_PROGRESS_END)
-        .await?;
-
-    process_video(&state.storage, &state.jobs, &id, temp_path.as_path()).await?;
+    process_video(&state.storage, &state.jobs, &id, temp_path.as_path(), None).await?;
     state.jobs.complete(id).await?;
 
     Ok(())
 }
 
-async fn run_remote_pipeline(state: AppState, id: Uuid, url: String) -> Result<(), AppError> {
+async fn run_remote_pipeline(
+    state: AppState,
+    id: Uuid,
+    url: String,
+    encode: Option<EncodeParams>,
+) -> Result<(), AppError> {
     cleanup::ensure_capacity(&state.storage, &state.jobs, &state.cleanup).await?;
     state.jobs.update_stage(id, JobStage::Downloading).await?;
-    state.jobs.update_progress(id, START_PROGRESS).await?;
 
     let temp_path = state.storage.incoming_path(&id);
     ensure_parent(&temp_path).await?;
@@ -429,30 +461,36 @@ async fn run_remote_pipeline(state: AppState, id: Uuid, url: String) -> Result<(
         file.write_all(&chunk).await?;
         downloaded += chunk.len() as u64;
         if let Some(total) = content_length {
-            let span = DOWNLOAD_PROGRESS_END - START_PROGRESS;
             let ratio = (downloaded as f32 / total as f32).clamp(0.0, 1.0);
-            let progress = START_PROGRESS + span * ratio;
-            state.jobs.update_progress(id, progress).await?;
+            state.jobs.update_progress(id, ratio).await?;
         }
     }
     file.flush().await?;
 
+    state.jobs.update_progress(id, 1.0).await?;
     state.jobs.update_stage(id, JobStage::Transcoding).await?;
-    state
-        .jobs
-        .update_progress(id, DOWNLOAD_PROGRESS_END)
-        .await?;
 
-    process_video(&state.storage, &state.jobs, &id, temp_path.as_path()).await?;
+    process_video(
+        &state.storage,
+        &state.jobs,
+        &id,
+        temp_path.as_path(),
+        encode,
+    )
+    .await?;
     state.jobs.complete(id).await?;
 
     Ok(())
 }
 
-async fn run_ytdlp_pipeline(state: AppState, id: Uuid, url: String) -> Result<(), AppError> {
+async fn run_ytdlp_pipeline(
+    state: AppState,
+    id: Uuid,
+    url: String,
+    encode: Option<EncodeParams>,
+) -> Result<(), AppError> {
     cleanup::ensure_capacity(&state.storage, &state.jobs, &state.cleanup).await?;
     state.jobs.update_stage(id, JobStage::Downloading).await?;
-    state.jobs.update_progress(id, START_PROGRESS).await?;
 
     let temp_path = state.storage.incoming_path(&id);
     ensure_parent(&temp_path).await?;
@@ -474,12 +512,15 @@ async fn run_ytdlp_pipeline(state: AppState, id: Uuid, url: String) -> Result<()
     }
 
     state.jobs.update_stage(id, JobStage::Transcoding).await?;
-    state
-        .jobs
-        .update_progress(id, DOWNLOAD_PROGRESS_END)
-        .await?;
 
-    process_video(&state.storage, &state.jobs, &id, temp_path.as_path()).await?;
+    process_video(
+        &state.storage,
+        &state.jobs,
+        &id,
+        temp_path.as_path(),
+        encode,
+    )
+    .await?;
     state.jobs.complete(id).await?;
 
     Ok(())

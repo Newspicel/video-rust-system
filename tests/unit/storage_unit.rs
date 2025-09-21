@@ -1,5 +1,6 @@
 use crate::error::AppError;
 use crate::storage::{ensure_dir, Storage};
+use std::env;
 use tempfile::tempdir;
 use uuid::Uuid;
 
@@ -22,7 +23,14 @@ async fn initialize_sets_up_directories() -> Result<(), AppError> {
     let download = storage.download_path(&id);
     assert!(download.ends_with("download.webm"));
 
-    assert!(storage.tmp_dir().exists());
+    let tmp_root = storage.tmp_dir();
+    assert!(tmp_root.exists());
+    assert!(tmp_root.starts_with(env::temp_dir()));
+    assert!(tmp_root.ends_with("vrs"));
+
+    let incoming_root = tmp_root.join("incoming");
+    assert!(incoming.starts_with(&incoming_root));
+
     assert!(storage.libs_dir().exists());
 
     Ok(())

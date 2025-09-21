@@ -122,6 +122,11 @@ async fn job_status_returns_latest_snapshot() {
     state.jobs.create_job(job_id).await.unwrap();
     state
         .jobs
+        .set_plan(job_id, vec![JobStage::Downloading, JobStage::Transcoding])
+        .await
+        .unwrap();
+    state
+        .jobs
         .update_stage(job_id, JobStage::Downloading)
         .await
         .unwrap();
@@ -143,7 +148,10 @@ async fn job_status_returns_latest_snapshot() {
     let body = to_bytes(response.into_body(), BODY_LIMIT).await.unwrap();
     let json: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["stage"], "downloading");
-    assert_eq!(json["progress"], 0.42);
+    let overall = json["progress"].as_f64().unwrap();
+    let stage_progress = json["stage_progress"].as_f64().unwrap();
+    assert!((overall - 0.21).abs() < 1e-6);
+    assert!((stage_progress - 0.42).abs() < 1e-6);
 }
 
 #[tokio::test]
@@ -211,6 +219,9 @@ async fn hls_asset_serves_playlist() {
     let temp = tempdir().unwrap();
     let state = build_state(temp.path()).await;
     let video_id = Uuid::new_v4();
+    let download = state.storage.download_path(&video_id);
+    storage::ensure_parent(&download).await.unwrap();
+    tokio::fs::write(&download, b"av1").await.unwrap();
     let master = state.storage.hls_dir(&video_id).join("master.m3u8");
     storage::ensure_parent(&master).await.unwrap();
     tokio::fs::write(&master, b"#EXTM3U\n").await.unwrap();
@@ -237,6 +248,9 @@ async fn dash_asset_serves_manifest() {
     let temp = tempdir().unwrap();
     let state = build_state(temp.path()).await;
     let video_id = Uuid::new_v4();
+    let download = state.storage.download_path(&video_id);
+    storage::ensure_parent(&download).await.unwrap();
+    tokio::fs::write(&download, b"av1").await.unwrap();
     let manifest = state.storage.dash_dir(&video_id).join("manifest.mpd");
     storage::ensure_parent(&manifest).await.unwrap();
     tokio::fs::write(&manifest, b"<MPD/>").await.unwrap();
