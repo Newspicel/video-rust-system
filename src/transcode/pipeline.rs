@@ -57,6 +57,17 @@ pub async fn process_video(
 
     let geometry = probe_video_geometry(&download_path).await?;
     let renditions = select_renditions(geometry);
+    let rendition_summary: Vec<String> = renditions
+        .iter()
+        .map(|r| format!("{}x{}@{}k", r.width, r.height, r.bitrate))
+        .collect();
+    tracing::debug!(
+        video_id = %id,
+        width = geometry.width,
+        height = geometry.height,
+        renditions = %rendition_summary.join(", "),
+        "selected rendition ladder"
+    );
 
     match fs::remove_file(input).await {
         Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
@@ -103,6 +114,8 @@ pub async fn process_video(
             }
         },
     )?;
+
+    tracing::debug!(video_id = %id, "segment generation finished");
 
     jobs.update_progress(*id, 1.0).await?;
     jobs.update_stage_eta(*id, Some(0.0)).await?;

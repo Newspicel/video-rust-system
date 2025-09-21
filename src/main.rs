@@ -65,9 +65,17 @@ fn setup_tracing() {
         return;
     }
 
-    let env_filter = env::var("RUST_LOG").unwrap_or_else(|_| "info,axum=info".to_string());
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
+    let env_filter =
+        env::var("RUST_LOG").unwrap_or_else(|_| "vrs=debug,axum=info,tower_http=info".to_string());
+
+    let init_result = tracing_subscriber::fmt()
+        .with_env_filter(env_filter.clone())
         .with_target(false)
+        .with_level(true)
+        .compact()
         .try_init();
+
+    if init_result.is_ok() {
+        tracing::debug!(current_filter = %env_filter, "tracing initialized");
+    }
 }

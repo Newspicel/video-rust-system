@@ -34,31 +34,43 @@ async fn run_ffmpeg_inner(
     args: Vec<OsString>,
     progress: Option<FfmpegProgressConfig>,
 ) -> Result<(), AppError> {
+    let printable_args: Vec<String> = args
+        .iter()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect();
+    tracing::debug!(command = %printable_args.join(" "), "spawning ffmpeg");
+
     let mut command = Command::new(FFMPEG_BIN);
     command.args(&args);
-
-    let mut progress_opt = progress;
-    if progress_opt.is_some() {
-        command.stderr(Stdio::piped());
-    }
+    command.stderr(Stdio::piped());
+    command.stdout(Stdio::null());
+    command.stdin(Stdio::null());
 
     let mut child = command.spawn().map_err(map_io_error)?;
-    let progress_handle = progress_opt.take().and_then(|config| {
-        child
-            .stderr
-            .take()
-            .map(|stderr| tokio::spawn(monitor_ffmpeg(stderr, config)))
-    });
+
+    let mut progress_opt = progress;
+    let stderr = child.stderr.take();
+    let monitor_handle = if let Some(stderr) = stderr {
+        if let Some(config) = progress_opt.take() {
+            Some(tokio::spawn(monitor_ffmpeg(stderr, config)))
+        } else {
+            Some(tokio::spawn(
+                async move { drain_ffmpeg(stderr, "ffmpeg").await },
+            ))
+        }
+    } else {
+        None
+    };
 
     let status = child.wait().await.map_err(map_io_error)?;
 
-    if let Some(handle) = progress_handle {
+    if let Some(handle) = monitor_handle {
         match handle.await {
             Ok(Ok(())) => {}
             Ok(Err(err)) => return Err(err),
             Err(join_err) => {
                 return Err(AppError::transcode(format!(
-                    "ffmpeg progress task failed: {join_err}"
+                    "ffmpeg stderr task failed: {join_err}"
                 )));
             }
         }
@@ -69,6 +81,8 @@ async fn run_ffmpeg_inner(
             "ffmpeg exited with status {status}"
         )));
     }
+
+    tracing::debug!(command = %printable_args.join(" "), "ffmpeg finished successfully");
 
     Ok(())
 }
@@ -93,11 +107,7 @@ async fn monitor_ffmpeg(
             for line in text.split('\n') {
                 let trimmed = line.trim();
                 if !trimmed.is_empty() {
-                    tracing::debug!(
-                        operation = %operation,
-                        message = %trimmed,
-                        "ffmpeg stderr"
-                    );
+                    log_ffmpeg_line(operation, trimmed);
                 }
             }
         }
@@ -133,8 +143,14 @@ async fn monitor_ffmpeg(
             }
 
             let line = String::from_utf8_lossy(&line_bytes);
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            log_ffmpeg_line(operation, trimmed);
             process_ffmpeg_line(
-                line.trim(),
+                trimmed,
                 ProgressContext {
                     jobs: &jobs,
                     job_id,
@@ -151,25 +167,75 @@ async fn monitor_ffmpeg(
 
     if !buffer.is_empty() {
         let line = String::from_utf8_lossy(&buffer);
-        process_ffmpeg_line(
-            line.trim(),
-            ProgressContext {
-                jobs: &jobs,
-                job_id,
-                total_seconds,
-                last_reported: &mut last_reported,
-                last_update: &mut last_update,
-                last_log: &mut last_log,
-                operation,
-            },
-        )
-        .await?;
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            log_ffmpeg_line(operation, trimmed);
+            process_ffmpeg_line(
+                trimmed,
+                ProgressContext {
+                    jobs: &jobs,
+                    job_id,
+                    total_seconds,
+                    last_reported: &mut last_reported,
+                    last_update: &mut last_update,
+                    last_log: &mut last_log,
+                    operation,
+                },
+            )
+            .await?;
+        }
     }
 
     if last_reported < 1.0 - PROGRESS_EPSILON {
         jobs.update_progress(job_id, 1.0).await?;
     }
     jobs.update_stage_eta(job_id, Some(0.0)).await?;
+
+    Ok(())
+}
+
+async fn drain_ffmpeg(mut stderr: ChildStderr, operation: &'static str) -> Result<(), AppError> {
+    let mut buffer = Vec::with_capacity(8192);
+    let mut chunk = [0u8; 4096];
+
+    loop {
+        let read = stderr.read(&mut chunk).await.map_err(map_io_error)?;
+        if read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+
+        while let Some(idx) = buffer
+            .iter()
+            .position(|byte| *byte == b'\r' || *byte == b'\n')
+        {
+            let mut line_bytes: Vec<u8> = buffer.drain(..=idx).collect();
+            while matches!(buffer.first(), Some(b'\r' | b'\n')) {
+                buffer.drain(..1);
+            }
+            while matches!(line_bytes.last(), Some(b'\r' | b'\n')) {
+                line_bytes.pop();
+            }
+            if line_bytes.is_empty() {
+                continue;
+            }
+
+            let line = String::from_utf8_lossy(&line_bytes);
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            log_ffmpeg_line(operation, trimmed);
+        }
+    }
+
+    if !buffer.is_empty() {
+        let line = String::from_utf8_lossy(&buffer);
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            log_ffmpeg_line(operation, trimmed);
+        }
+    }
 
     Ok(())
 }
@@ -326,6 +392,45 @@ fn format_eta(seconds: f64) -> String {
         format!("{minutes}m {secs:02}s")
     } else {
         format!("{total}s")
+    }
+}
+
+fn log_ffmpeg_line(operation: &str, line: &str) {
+    let lowered = line.to_ascii_lowercase();
+
+    if lowered.contains("error") || lowered.contains("failed") || lowered.contains("fatal") {
+        tracing::error!(operation = %operation, message = %line, "ffmpeg message");
+        return;
+    }
+
+    if lowered.contains("warning") || lowered.contains("deprecated") {
+        tracing::warn!(operation = %operation, message = %line, "ffmpeg message");
+        return;
+    }
+
+    if lowered.contains("speed=")
+        || lowered.contains("muxing overhead")
+        || lowered.contains("kb/s")
+        || lowered.contains("encoded")
+    {
+        tracing::debug!(operation = %operation, message = %line, "ffmpeg message");
+        return;
+    }
+
+    if lowered.contains("opening '") || lowered.contains("closing '") {
+        return;
+    }
+
+    if lowered.starts_with("[dash") || lowered.starts_with("[hls") {
+        return;
+    }
+
+    if lowered.starts_with("input #")
+        || lowered.starts_with("output #")
+        || lowered.contains("stream #")
+        || lowered.contains("encoder")
+    {
+        tracing::debug!(operation = %operation, message = %line, "ffmpeg message");
     }
 }
 

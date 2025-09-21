@@ -73,10 +73,13 @@ pub(super) fn spawn_ytdlp_pipeline(
 }
 
 async fn run_local_pipeline(state: AppState, id: Uuid, temp_path: PathBuf) -> Result<(), AppError> {
+    tracing::debug!(%id, path = %temp_path.display(), "starting local pipeline");
     cleanup::ensure_capacity(&state.storage, &state.jobs, &state.cleanup).await?;
     state.jobs.update_stage(id, JobStage::Transcoding).await?;
     process_video(&state.storage, &state.jobs, &id, temp_path.as_path(), None).await?;
     state.jobs.complete(id).await?;
+
+    tracing::debug!(%id, "local pipeline finished");
 
     Ok(())
 }
@@ -92,12 +95,14 @@ async fn run_remote_pipeline(
 
     let temp_path = state.storage.incoming_path(&id);
     ensure_parent(&temp_path).await?;
+    tracing::debug!(%id, %url, path = %temp_path.display(), "remote download starting");
 
     let parsed_url = Url::parse(&url);
     if should_use_aria2(&url, &parsed_url) {
         state.jobs.update_progress(id, 0.0).await?;
         download_with_aria2(&url, &temp_path).await?;
         state.jobs.update_progress(id, 1.0).await?;
+        tracing::debug!(%id, %url, path = %temp_path.display(), "remote download completed via aria2");
     } else {
         let http_url = parsed_url.map_err(|err| AppError::validation(err.to_string()))?;
         let mut response = state
@@ -123,9 +128,17 @@ async fn run_remote_pipeline(
         file.flush().await?;
 
         state.jobs.update_progress(id, 1.0).await?;
+        tracing::debug!(
+            %id,
+            %url,
+            path = %temp_path.display(),
+            bytes = downloaded,
+            "remote download completed"
+        );
     }
 
     state.jobs.update_stage(id, JobStage::Transcoding).await?;
+    tracing::debug!(%id, %url, path = %temp_path.display(), "starting transcode for remote job");
 
     process_video(
         &state.storage,
@@ -136,6 +149,7 @@ async fn run_remote_pipeline(
     )
     .await?;
     state.jobs.complete(id).await?;
+    tracing::debug!(%id, %url, "remote pipeline finished");
 
     Ok(())
 }
@@ -151,6 +165,7 @@ async fn run_ytdlp_pipeline(
 
     let temp_path = state.storage.incoming_path(&id);
     ensure_parent(&temp_path).await?;
+    tracing::debug!(%id, %url, path = %temp_path.display(), "yt-dlp download starting");
 
     let fetcher = prepare_ytdlp_fetcher(&state).await?;
 
@@ -167,8 +182,10 @@ async fn run_ytdlp_pipeline(
     if downloaded_path != temp_path {
         fs::rename(&downloaded_path, &temp_path).await?;
     }
+    tracing::debug!(%id, %url, path = %temp_path.display(), "yt-dlp download finished");
 
     state.jobs.update_stage(id, JobStage::Transcoding).await?;
+    tracing::debug!(%id, %url, path = %temp_path.display(), "starting transcode for yt-dlp job");
 
     process_video(
         &state.storage,
@@ -179,6 +196,7 @@ async fn run_ytdlp_pipeline(
     )
     .await?;
     state.jobs.complete(id).await?;
+    tracing::debug!(%id, %url, "yt-dlp pipeline finished");
 
     Ok(())
 }
@@ -252,6 +270,7 @@ async fn download_with_aria2(source: &str, destination: &Path) -> Result<(), App
     }
 
     if destination.exists() {
+        tracing::debug!(source, dest = %destination.display(), "aria2 produced target file directly");
         return Ok(());
     }
 
@@ -266,6 +285,7 @@ async fn download_with_aria2(source: &str, destination: &Path) -> Result<(), App
             .is_file()
         {
             tokio::fs::rename(&candidate, destination).await?;
+            tracing::debug!(source, temp = %candidate.display(), dest = %destination.display(), "aria2 download moved into place");
             return Ok(());
         }
     }
