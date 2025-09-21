@@ -549,7 +549,7 @@ async fn run_ytdlp_pipeline(
 async fn prepare_ytdlp_fetcher(state: &AppState) -> Result<Youtube, AppError> {
     let libs_dir = state.storage.libs_dir();
     ensure_dir(libs_dir.as_path()).await?;
-    let output_dir = state.storage.tmp_dir();
+    let output_dir: PathBuf = state.storage.tmp_dir();
 
     let youtube_path = libs_dir.join(binary_name("yt-dlp"));
     let ffmpeg_path = libs_dir.join(binary_name("ffmpeg"));
