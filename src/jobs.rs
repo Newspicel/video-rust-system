@@ -16,6 +16,7 @@ pub trait JobStore: Send + Sync {
     async fn set_plan(&self, id: Uuid, plan: Vec<JobStage>) -> Result<(), AppError>;
     async fn update_stage(&self, id: Uuid, stage: JobStage) -> Result<(), AppError>;
     async fn update_progress(&self, id: Uuid, progress: f32) -> Result<(), AppError>;
+    async fn update_stage_eta(&self, id: Uuid, eta_seconds: Option<f64>) -> Result<(), AppError>;
     async fn fail(&self, id: Uuid, error: String) -> Result<(), AppError>;
     async fn complete(&self, id: Uuid) -> Result<(), AppError>;
     async fn status(&self, id: &Uuid) -> Result<Option<JobStatusResponse>, AppError>;
@@ -71,9 +72,18 @@ impl JobStore for LocalJobStore {
         Ok(())
     }
 
+    async fn update_stage_eta(&self, id: Uuid, eta_seconds: Option<f64>) -> Result<(), AppError> {
+        if let Some(record) = self.inner.lock().await.get_mut(&id) {
+            record.stage_eta_seconds = eta_seconds;
+            record.touch();
+        }
+        Ok(())
+    }
+
     async fn fail(&self, id: Uuid, error: String) -> Result<(), AppError> {
         if let Some(record) = self.inner.lock().await.get_mut(&id) {
             record.fail(error);
+            record.stage_eta_seconds = None;
         }
         Ok(())
     }
@@ -81,6 +91,7 @@ impl JobStore for LocalJobStore {
     async fn complete(&self, id: Uuid) -> Result<(), AppError> {
         if let Some(record) = self.inner.lock().await.get_mut(&id) {
             record.complete();
+            record.stage_eta_seconds = Some(0.0);
         }
         Ok(())
     }
@@ -110,6 +121,9 @@ struct JobRecord {
     last_update_system: SystemTime,
     error: Option<String>,
     plan: Vec<JobStage>,
+    stage_started_at_instant: Instant,
+    stage_started_at_system: SystemTime,
+    stage_eta_seconds: Option<f64>,
 }
 
 impl JobRecord {
@@ -125,6 +139,9 @@ impl JobRecord {
             last_update_system: now_system,
             error: None,
             plan: Vec::new(),
+            stage_started_at_instant: now_instant,
+            stage_started_at_system: now_system,
+            stage_eta_seconds: None,
         }
     }
 
@@ -136,6 +153,9 @@ impl JobRecord {
     fn set_stage(&mut self, stage: JobStage) {
         self.stage = stage;
         self.stage_progress = 0.0;
+        self.stage_started_at_instant = Instant::now();
+        self.stage_started_at_system = SystemTime::now();
+        self.stage_eta_seconds = None;
         self.touch();
     }
 
@@ -153,6 +173,7 @@ impl JobRecord {
     fn complete(&mut self) {
         self.stage = JobStage::Complete;
         self.stage_progress = 1.0;
+        self.stage_eta_seconds = Some(0.0);
         self.touch();
     }
 
@@ -170,14 +191,7 @@ impl JobRecord {
         let (overall_progress, stage_progress, stage_index, total_stages) =
             self.compute_progress_metrics();
 
-        let estimated_remaining_seconds = if overall_progress >= 1.0 {
-            Some(0.0)
-        } else if overall_progress > 0.0 {
-            let total_estimated = elapsed_seconds / overall_progress as f64;
-            Some((total_estimated - elapsed_seconds).max(0.0))
-        } else {
-            None
-        };
+        let estimated_remaining_seconds = self.estimate_remaining_seconds(stage_progress);
 
         JobStatusResponse {
             id,
@@ -248,6 +262,34 @@ impl JobRecord {
                 )
             }
         }
+    }
+
+    fn estimate_remaining_seconds(&self, stage_progress: f32) -> Option<f64> {
+        const INITIAL_ESTIMATE_SECONDS: f64 = 45.0 * 60.0; // 45 minutes as an upper-bound guess
+        const MIN_STAGE_PROGRESS_FOR_ESTIMATE: f32 = 0.02;
+
+        if matches!(self.stage, JobStage::Complete) {
+            return Some(0.0);
+        }
+
+        if let Some(eta) = self.stage_eta_seconds {
+            return Some(eta.max(0.0));
+        }
+
+        let stage_elapsed = self.stage_elapsed_seconds();
+
+        if stage_progress < MIN_STAGE_PROGRESS_FOR_ESTIMATE {
+            let baseline = INITIAL_ESTIMATE_SECONDS.max(stage_elapsed.max(1.0) * 6.0);
+            return Some(baseline);
+        }
+
+        let divisor = stage_progress.max(MIN_STAGE_PROGRESS_FOR_ESTIMATE) as f64;
+        let total_estimated = stage_elapsed / divisor;
+        Some((total_estimated - stage_elapsed).max(0.0))
+    }
+
+    fn stage_elapsed_seconds(&self) -> f64 {
+        self.stage_started_at_instant.elapsed().as_secs_f64()
     }
 }
 

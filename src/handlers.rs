@@ -1,9 +1,14 @@
-use std::{future::Future, path::PathBuf, time::Duration};
+use std::{
+    collections::HashSet,
+    future::Future,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use axum::{
     Json,
     body::Body,
-    extract::{FromRequestParts, Multipart, Path, State},
+    extract::{FromRequestParts, Multipart, Path as AxumPath, State},
     http::{self, HeaderValue, StatusCode},
     response::Response,
 };
@@ -11,7 +16,9 @@ use reqwest::Url;
 use serde::Deserialize;
 use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
+use tokio::process::Command as TokioCommand;
 use tokio_util::io::ReaderStream;
+use url::ParseError;
 use uuid::Uuid;
 use yt_dlp::{Youtube, fetcher::deps::Libraries};
 
@@ -23,6 +30,8 @@ use crate::{
     storage::{ensure_dir, ensure_parent},
     transcode::{EncodeParams, ensure_dash_ready, ensure_hls_ready, process_video},
 };
+
+const ARIA2_BIN: &str = "aria2c";
 
 #[derive(Debug, serde::Serialize)]
 pub struct UploadResponse {
@@ -104,8 +113,6 @@ pub async fn upload_remote(
     State(state): State<AppState>,
     Json(payload): Json<RemoteUploadRequest>,
 ) -> Result<Json<UploadResponse>, AppError> {
-    let url = Url::parse(&payload.url)
-        .map_err(|err| AppError::validation(format!("invalid url: {err}")))?;
     let encode = payload.transcode.map(EncodeParams::from);
     let id = Uuid::new_v4();
     state.jobs.create_job(id).await?;
@@ -115,8 +122,11 @@ pub async fn upload_remote(
         .await?;
 
     let state_for_task = state.clone();
-    let url_string: String = url.into();
-    spawn_remote_pipeline(state_for_task, id, url_string, encode);
+    let raw_url = payload.url.clone();
+    if !raw_url.starts_with("magnet:") {
+        Url::parse(&raw_url).map_err(|err| AppError::validation(format!("invalid url: {err}")))?;
+    }
+    spawn_remote_pipeline(state_for_task, id, raw_url, encode);
 
     Ok(Json(build_upload_response(id)))
 }
@@ -144,7 +154,7 @@ pub async fn download_via_ytdlp(
 
 pub async fn download_video(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    AxumPath(id): AxumPath<String>,
     RangeHeader(range_header): RangeHeader,
 ) -> Result<Response, AppError> {
     let video_id =
@@ -155,7 +165,7 @@ pub async fn download_video(
 
 pub async fn get_hls_asset(
     State(state): State<AppState>,
-    Path((id, asset)): Path<(String, String)>,
+    AxumPath((id, asset)): AxumPath<(String, String)>,
 ) -> Result<Response, AppError> {
     let video_id =
         Uuid::parse_str(&id).map_err(|_| AppError::validation("invalid video identifier"))?;
@@ -167,7 +177,7 @@ pub async fn get_hls_asset(
 
 pub async fn get_dash_asset(
     State(state): State<AppState>,
-    Path((id, asset)): Path<(String, String)>,
+    AxumPath((id, asset)): AxumPath<(String, String)>,
 ) -> Result<Response, AppError> {
     let video_id =
         Uuid::parse_str(&id).map_err(|_| AppError::validation("invalid video identifier"))?;
@@ -369,7 +379,7 @@ where
 
 pub async fn job_status(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    AxumPath(id): AxumPath<String>,
 ) -> Result<Json<JobStatusResponse>, AppError> {
     let job_id =
         Uuid::parse_str(&id).map_err(|_| AppError::validation("invalid job identifier"))?;
@@ -446,29 +456,38 @@ async fn run_remote_pipeline(
     let temp_path = state.storage.incoming_path(&id);
     ensure_parent(&temp_path).await?;
 
-    let mut response = state
-        .http_client
-        .get(Url::parse(&url).map_err(|err| AppError::validation(err.to_string()))?)
-        .timeout(Duration::from_secs(60 * 10))
-        .send()
-        .await?
-        .error_for_status()?;
+    let parsed_url = Url::parse(&url);
+    if should_use_aria2(&url, &parsed_url) {
+        state.jobs.update_progress(id, 0.0).await?;
+        download_with_aria2(&url, &temp_path).await?;
+        state.jobs.update_progress(id, 1.0).await?;
+    } else {
+        let http_url = parsed_url.map_err(|err| AppError::validation(err.to_string()))?;
+        let mut response = state
+            .http_client
+            .get(http_url)
+            .timeout(Duration::from_secs(60 * 10))
+            .send()
+            .await?
+            .error_for_status()?;
 
-    let mut file = File::create(&temp_path).await?;
-    let content_length = response.content_length();
-    let mut downloaded: u64 = 0;
+        let mut file = File::create(&temp_path).await?;
+        let content_length = response.content_length();
+        let mut downloaded: u64 = 0;
 
-    while let Some(chunk) = response.chunk().await? {
-        file.write_all(&chunk).await?;
-        downloaded += chunk.len() as u64;
-        if let Some(total) = content_length {
-            let ratio = (downloaded as f32 / total as f32).clamp(0.0, 1.0);
-            state.jobs.update_progress(id, ratio).await?;
+        while let Some(chunk) = response.chunk().await? {
+            file.write_all(&chunk).await?;
+            downloaded += chunk.len() as u64;
+            if let Some(total) = content_length {
+                let ratio = (downloaded as f32 / total as f32).clamp(0.0, 1.0);
+                state.jobs.update_progress(id, ratio).await?;
+            }
         }
-    }
-    file.flush().await?;
+        file.flush().await?;
 
-    state.jobs.update_progress(id, 1.0).await?;
+        state.jobs.update_progress(id, 1.0).await?;
+    }
+
     state.jobs.update_stage(id, JobStage::Transcoding).await?;
 
     process_video(
@@ -548,6 +567,99 @@ async fn prepare_ytdlp_fetcher(state: &AppState) -> Result<Youtube, AppError> {
     install_ytdlp_binaries(libs_dir, output_dir).await
 }
 
+async fn download_with_aria2(source: &str, destination: &Path) -> Result<(), AppError> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| AppError::transcode("temporary destination missing parent directory"))?;
+
+    let before = dir_snapshot(parent).await?;
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| AppError::transcode("temporary destination missing file name"))?;
+
+    let is_magnet = source.starts_with("magnet:");
+    let is_torrent = source.to_ascii_lowercase().ends_with(".torrent");
+
+    let mut command = TokioCommand::new(ARIA2_BIN);
+    command
+        .arg("--allow-overwrite=true")
+        .arg("--auto-file-renaming=false")
+        .arg("--summary-interval=0")
+        .arg("--seed-time=0")
+        .arg("--dir")
+        .arg(parent);
+
+    if !is_magnet && !is_torrent {
+        command.arg("--out").arg(file_name);
+    }
+
+    command.arg(source);
+
+    let status = command
+        .status()
+        .await
+        .map_err(|err| map_spawn_error(err, ARIA2_BIN))?;
+
+    if !status.success() {
+        return Err(AppError::dependency(format!(
+            "aria2c exited with status {status}"
+        )));
+    }
+
+    if destination.exists() {
+        return Ok(());
+    }
+
+    let after = dir_snapshot(parent).await?;
+    let mut new_entries: Vec<PathBuf> = after.difference(&before).cloned().collect();
+
+    if new_entries.len() == 1 {
+        let candidate = new_entries.remove(0);
+        if tokio::fs::metadata(&candidate)
+            .await
+            .map_err(AppError::from)?
+            .is_file()
+        {
+            tokio::fs::rename(&candidate, destination).await?;
+            return Ok(());
+        }
+    }
+
+    Err(AppError::transcode(
+        "aria2c produced unexpected output (expected a single file)",
+    ))
+}
+
+fn should_use_aria2(url_str: &str, parsed: &Result<Url, ParseError>) -> bool {
+    let lower = url_str.to_ascii_lowercase();
+    if url_str.starts_with("magnet:") || lower.ends_with(".torrent") {
+        return true;
+    }
+
+    if let Ok(url) = parsed {
+        matches!(url.scheme(), "ftp" | "ftps" | "p2p")
+    } else {
+        false
+    }
+}
+
+async fn dir_snapshot(dir: &Path) -> Result<HashSet<PathBuf>, AppError> {
+    let mut entries = fs::read_dir(dir).await?;
+    let mut set = HashSet::new();
+    while let Some(entry) = entries.next_entry().await? {
+        set.insert(entry.path());
+    }
+    Ok(set)
+}
+
+fn map_spawn_error(err: std::io::Error, tool: &str) -> AppError {
+    match err.kind() {
+        std::io::ErrorKind::NotFound => AppError::dependency(format!("{tool} not found on PATH")),
+        _ => AppError::dependency(format!("failed to spawn {tool}: {err}")),
+    }
+}
+
 fn binary_name(base: &str) -> String {
     if cfg!(target_os = "windows") {
         format!("{base}.exe")
@@ -572,8 +684,59 @@ async fn install_ytdlp_binaries(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use url::ParseError;
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/unit/handlers_unit.rs"
     ));
+
+    #[test]
+    fn aria2_detection_handles_magnet() {
+        let err: Result<Url, ParseError> = Err(ParseError::RelativeUrlWithoutBase);
+        assert!(super::should_use_aria2("magnet:?xt=urn:btih:test", &err));
+    }
+
+    #[test]
+    fn aria2_detection_handles_ftp() {
+        let parsed: Result<Url, ParseError> =
+            Ok(Url::parse("ftp://example.com/video.mp4").unwrap());
+        assert!(super::should_use_aria2(
+            "ftp://example.com/video.mp4",
+            &parsed
+        ));
+    }
+
+    #[test]
+    fn aria2_detection_skips_https() {
+        let parsed: Result<Url, ParseError> =
+            Ok(Url::parse("https://example.com/video.mp4").unwrap());
+        assert!(!super::should_use_aria2(
+            "https://example.com/video.mp4",
+            &parsed
+        ));
+    }
+
+    #[tokio::test]
+    async fn dir_snapshot_detects_new_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let before = super::dir_snapshot(temp.path()).await.unwrap();
+        assert!(before.is_empty());
+
+        let file_path = temp.path().join("example.bin");
+        tokio::fs::write(&file_path, b"data").await.unwrap();
+
+        let after = super::dir_snapshot(temp.path()).await.unwrap();
+        assert!(after.contains(&file_path));
+    }
+
+    #[test]
+    fn map_spawn_error_formats_messages() {
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "missing");
+        let mapped = super::map_spawn_error(err, "aria2c");
+        assert!(mapped.to_string().contains("aria2c"));
+
+        let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let mapped = super::map_spawn_error(err, "aria2c");
+        assert!(mapped.to_string().contains("failed to spawn"));
+    }
 }

@@ -222,9 +222,19 @@ async fn hls_asset_serves_playlist() {
     let download = state.storage.download_path(&video_id);
     storage::ensure_parent(&download).await.unwrap();
     tokio::fs::write(&download, b"av1").await.unwrap();
-    let master = state.storage.hls_dir(&video_id).join("master.m3u8");
-    storage::ensure_parent(&master).await.unwrap();
-    tokio::fs::write(&master, b"#EXTM3U\n").await.unwrap();
+    let hls_dir = state.storage.hls_dir(&video_id);
+    storage::ensure_dir(&hls_dir).await.unwrap();
+    let master = hls_dir.join("master.m3u8");
+    let index = hls_dir.join("index.m3u8");
+    tokio::fs::write(
+        &master,
+        b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1280000\nindex.m3u8\n",
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(&index, b"#EXTM3U\n#EXTINF:4.0,\nsegment_00000.m4s\n")
+        .await
+        .unwrap();
 
     let app = build_app(state);
 

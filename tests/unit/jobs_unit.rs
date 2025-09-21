@@ -63,6 +63,7 @@ async fn local_job_store_lifecycle() -> Result<(), AppError> {
     assert_eq!(complete.progress, 1.0);
     assert!(complete.error.as_deref().is_some());
     assert!((complete.stage_progress - 1.0).abs() < f32::EPSILON);
+    assert_eq!(complete.estimated_remaining_seconds, Some(0.0));
 
     let all = store.list().await?;
     assert_eq!(all.len(), 1);
@@ -108,6 +109,26 @@ async fn progress_handles_stage_missing_from_plan() -> Result<(), AppError> {
     assert_eq!(status.stage_progress, 0.3);
     assert!((status.progress - 0.3).abs() < f32::EPSILON);
     assert_eq!(status.current_stage_index, None);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn stage_eta_reflected_in_response() -> Result<(), AppError> {
+    let store = LocalJobStore::new();
+    let id = Uuid::new_v4();
+
+    store.create_job(id).await?;
+    store
+        .set_plan(id, vec![JobStage::Downloading, JobStage::Transcoding])
+        .await?;
+    store.update_stage(id, JobStage::Transcoding).await?;
+    store.update_progress(id, 0.6).await?;
+    store.update_stage_eta(id, Some(42.0)).await?;
+
+    let status = store.status(&id).await?.expect("missing job status");
+    assert_eq!(status.stage, JobStage::Transcoding);
+    assert_eq!(status.estimated_remaining_seconds, Some(42.0));
 
     Ok(())
 }

@@ -1,18 +1,11 @@
 use std::{
+    env,
     ffi::OsString,
-    path::{Path, PathBuf},
+    path::Path,
     process::Stdio,
     time::{Duration, Instant},
 };
 
-use hlskit::{
-    models::hls_video::HlsVideo,
-    models::hls_video_processing_settings::{
-        FfmpegVideoProcessingPreset, HlsVideoAudioBitrate, HlsVideoAudioCodec,
-        HlsVideoProcessingSettings,
-    },
-    process_video_from_path,
-};
 use tokio::{
     fs,
     io::AsyncReadExt,
@@ -22,21 +15,22 @@ use uuid::Uuid;
 
 use crate::{
     error::AppError,
-    jobs::DynJobStore,
+    jobs::{DynJobStore, JobStage},
     storage::{Storage, ensure_dir, ensure_parent},
 };
 
 const FFMPEG_BIN: &str = "ffmpeg";
 const FFPROBE_BIN: &str = "ffprobe";
-
-const GOP_LENGTH: &str = "120";
 const SEGMENT_SECONDS: &str = "4";
-const DEFAULT_DIMENSIONS: (u32, u32) = (1920, 1080);
+const PROGRESS_EPSILON: f32 = 0.005;
+const MAX_PROGRESS_UPDATE_INTERVAL: Duration = Duration::from_secs(3);
+const PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug)]
 pub struct EncodeParams {
     pub crf: u8,
     pub cpu_used: u8,
+    encoder: Option<EncoderKind>,
 }
 
 impl EncodeParams {
@@ -44,7 +38,12 @@ impl EncodeParams {
         Self {
             crf: self.crf.clamp(0, 63),
             cpu_used: self.cpu_used.clamp(0, 8),
+            encoder: self.encoder,
         }
+    }
+
+    fn preferred_encoder(&self) -> Option<EncoderKind> {
+        self.encoder
     }
 }
 
@@ -53,46 +52,19 @@ impl Default for EncodeParams {
         Self {
             crf: 24,
             cpu_used: 4,
+            encoder: None,
         }
     }
 }
 
-#[derive(Clone, Copy)]
-struct Rendition {
-    name: &'static str,
-    height: u32,
-    video_bitrate: &'static str,
-    maxrate: &'static str,
-    bufsize: &'static str,
-    audio_bitrate: &'static str,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum EncoderKind {
+    VideoToolboxAv1,
+    NvencAv1,
+    QsvAv1,
+    VaapiAv1,
+    SoftwareAv1,
 }
-
-const RENDITIONS: &[Rendition] = &[
-    Rendition {
-        name: "2160p",
-        height: 2160,
-        video_bitrate: "8000k",
-        maxrate: "12000k",
-        bufsize: "16000k",
-        audio_bitrate: "192k",
-    },
-    Rendition {
-        name: "1080p",
-        height: 1080,
-        video_bitrate: "4000k",
-        maxrate: "6000k",
-        bufsize: "8000k",
-        audio_bitrate: "160k",
-    },
-    Rendition {
-        name: "720p",
-        height: 720,
-        video_bitrate: "2200k",
-        maxrate: "3300k",
-        bufsize: "4400k",
-        audio_bitrate: "128k",
-    },
-];
 
 pub async fn process_video(
     storage: &Storage,
@@ -122,16 +94,40 @@ pub async fn process_video(
 
     encode_download(jobs, id, &download_path, input, has_audio, duration, params).await?;
 
-    if duration.is_none() {
-        jobs.update_progress(*id, 1.0).await?;
-    }
-
     match fs::remove_file(input).await {
         Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
             tracing::warn!(path = %input.display(), ?err, "failed to remove temporary input file");
         }
         _ => {}
     }
+
+    jobs.update_progress(*id, 0.95).await?;
+    jobs.update_stage(*id, JobStage::Finalizing).await?;
+
+    let storage_for_hls = storage.clone();
+    let storage_for_dash = storage.clone();
+    let id_for_hls = *id;
+    let id_for_dash = *id;
+    let download_for_hls = download_path.clone();
+    let download_for_dash = download_path.clone();
+
+    tokio::try_join!(
+        async move {
+            generate_hls_stream(&storage_for_hls, &id_for_hls, &download_for_hls, has_audio).await
+        },
+        async move {
+            generate_dash_stream(
+                &storage_for_dash,
+                &id_for_dash,
+                &download_for_dash,
+                has_audio,
+            )
+            .await
+        },
+    )?;
+
+    jobs.update_progress(*id, 1.0).await?;
+    jobs.update_stage_eta(*id, Some(0.0)).await?;
 
     Ok(())
 }
@@ -145,15 +141,13 @@ pub async fn ensure_hls_ready(storage: &Storage, id: &Uuid) -> Result<(), AppErr
         )));
     }
 
-    let master = storage.hls_dir(id).join("master.m3u8");
-    if master.exists() {
+    let index = storage.hls_dir(id).join("index.m3u8");
+    if index.exists() {
         return Ok(());
     }
 
-    let dimensions = probe_dimensions(&source)
-        .await
-        .unwrap_or(DEFAULT_DIMENSIONS);
-    generate_hls(storage, id, &source, dimensions).await
+    let has_audio = probe_has_audio(&source).await.unwrap_or(false);
+    generate_hls_stream(storage, id, &source, has_audio).await
 }
 
 pub async fn ensure_dash_ready(storage: &Storage, id: &Uuid) -> Result<(), AppError> {
@@ -170,17 +164,8 @@ pub async fn ensure_dash_ready(storage: &Storage, id: &Uuid) -> Result<(), AppEr
         return Ok(());
     }
 
-    let has_audio = match probe_has_audio(&source).await {
-        Ok(value) => value,
-        Err(err) => {
-            tracing::warn!(
-                ?err,
-                "failed to probe audio stream; defaulting to video-only DASH"
-            );
-            false
-        }
-    };
-    generate_dash(storage, id, &source, has_audio).await
+    let has_audio = probe_has_audio(&source).await.unwrap_or(false);
+    generate_dash_stream(storage, id, &source, has_audio).await
 }
 
 async fn encode_download(
@@ -194,305 +179,212 @@ async fn encode_download(
 ) -> Result<(), AppError> {
     ensure_parent(output).await?;
 
-    let mut args = vec![os("-y"), os("-i"), os_path(input)];
+    let candidates = encoder_candidates(params.preferred_encoder());
+    let mut last_error: Option<AppError> = None;
 
-    args.extend([
-        os("-c:v"),
-        os("libaom-av1"),
-        os("-crf"),
-        os(params.crf.to_string()),
-        os("-b:v"),
-        os("0"),
-        os("-g"),
-        os(GOP_LENGTH),
-        os("-cpu-used"),
-        os(params.cpu_used.to_string()),
-        os("-pix_fmt"),
-        os("yuv420p"),
-    ]);
+    for encoder in candidates {
+        let mut args = base_encode_args(input);
+        apply_encoder_args(&mut args, encoder, params);
+        apply_audio_args(&mut args, has_audio);
+        args.push(os_path(output));
+
+        tracing::info!(encoder = ?encoder, path = %output.display(), "starting encode" );
+
+        let result = if let Some(total) = duration {
+            run_ffmpeg_with_progress(
+                args,
+                FfmpegProgressConfig {
+                    total_duration: total,
+                    jobs: jobs.clone(),
+                    job_id: *id,
+                    operation: "encode_download",
+                },
+            )
+            .await
+        } else {
+            run_ffmpeg(args).await
+        };
+
+        match result {
+            Ok(()) => {
+                jobs.update_stage_eta(*id, Some(0.0)).await?;
+                return Ok(());
+            }
+            Err(err) => {
+                tracing::warn!(
+                    encoder = ?encoder,
+                    error = %err,
+                    "ffmpeg encode failed, attempting fallback"
+                );
+                last_error = Some(err);
+                continue;
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| AppError::transcode("encode pipeline failed")))
+}
+
+fn base_encode_args(input: &Path) -> Vec<OsString> {
+    vec![os("-y"), os("-i"), os_path(input)]
+}
+
+fn apply_encoder_args(args: &mut Vec<OsString>, encoder: EncoderKind, params: EncodeParams) {
+    match encoder {
+        EncoderKind::VideoToolboxAv1 => {
+            args.extend([
+                os("-c:v"),
+                os("av1_videotoolbox"),
+                os("-q:v"),
+                os(params.crf.to_string()),
+                os("-pix_fmt"),
+                os("yuv420p"),
+            ]);
+        }
+        EncoderKind::NvencAv1 => {
+            let cq = params.crf.min(51);
+            args.extend([
+                os("-hwaccel"),
+                os("cuda"),
+                os("-hwaccel_output_format"),
+                os("cuda"),
+                os("-c:v"),
+                os("av1_nvenc"),
+                os("-preset"),
+                os("p5"),
+                os("-cq"),
+                os(cq.to_string()),
+                os("-pix_fmt"),
+                os("yuv420p"),
+            ]);
+        }
+        EncoderKind::QsvAv1 => {
+            args.extend([
+                os("-hwaccel"),
+                os("qsv"),
+                os("-c:v"),
+                os("av1_qsv"),
+                os("-global_quality"),
+                os(params.crf.to_string()),
+                os("-pix_fmt"),
+                os("yuv420p"),
+            ]);
+        }
+        EncoderKind::VaapiAv1 => {
+            let device =
+                env::var("VIDEO_VAAPI_DEVICE").unwrap_or_else(|_| "/dev/dri/renderD128".into());
+            args.extend([
+                os("-hwaccel"),
+                os("vaapi"),
+                os("-hwaccel_device"),
+                os(device),
+                os("-hwaccel_output_format"),
+                os("vaapi"),
+                os("-vf"),
+                os("format=nv12,hwupload"),
+                os("-c:v"),
+                os("av1_vaapi"),
+                os("-qp"),
+                os(params.crf.to_string()),
+            ]);
+        }
+        EncoderKind::SoftwareAv1 => {
+            args.extend([
+                os("-c:v"),
+                os("libaom-av1"),
+                os("-crf"),
+                os(params.crf.to_string()),
+                os("-b:v"),
+                os("0"),
+                os("-g"),
+                os("120"),
+                os("-cpu-used"),
+                os(params.cpu_used.to_string()),
+                os("-pix_fmt"),
+                os("yuv420p"),
+            ]);
+        }
+    }
+}
+
+fn apply_audio_args(args: &mut Vec<OsString>, has_audio: bool) {
+    if has_audio {
+        args.extend([os("-c:a"), os("libopus"), os("-b:a"), os("192k")]);
+    } else {
+        args.push(os("-an"));
+    }
+}
+
+async fn generate_hls_stream(
+    storage: &Storage,
+    id: &Uuid,
+    source: &Path,
+    has_audio: bool,
+) -> Result<(), AppError> {
+    let hls_dir = storage.hls_dir(id);
+    ensure_dir(&hls_dir).await?;
+
+    let segment_pattern = hls_dir.join("segment_%05d.m4s");
+    let mut args = vec![os("-y"), os("-i"), os_path(source), os("-c:v"), os("copy")];
 
     if has_audio {
-        args.extend([
-            os("-c:a"),
-            os("libopus"),
-            os("-b:a"),
-            os(RENDITIONS[0].audio_bitrate),
-        ]);
+        args.extend([os("-c:a"), os("copy")]);
     } else {
         args.push(os("-an"));
     }
 
-    args.push(os(output));
-
-    let result = if let Some(total_duration) = duration {
-        run_ffmpeg_with_progress(
-            args,
-            FfmpegProgressConfig {
-                total_duration,
-                jobs: jobs.clone(),
-                job_id: *id,
-                operation: "encode_download",
-            },
-        )
-        .await
-    } else {
-        run_ffmpeg(args).await
-    };
-
-    if result.is_ok() {
-        jobs.update_progress(*id, 1.0).await?;
-    }
-
-    result
-}
-
-async fn generate_hls(
-    storage: &Storage,
-    id: &Uuid,
-    input: &Path,
-    source_dimensions: (u32, u32),
-) -> Result<(), AppError> {
-    let (hlskit_input, is_temporary) = prepare_hlskit_input(storage, id, input).await?;
-    let profiles = build_hls_profiles(source_dimensions);
-    let settings: Vec<HlsVideoProcessingSettings> = profiles
-        .iter()
-        .map(|profile| profile.settings.clone())
-        .collect();
-
-    let input_str = hlskit_input
-        .to_str()
-        .ok_or_else(|| AppError::transcode("hlskit input path contains invalid UTF-8"))?;
-
-    let video = process_video_from_path(input_str, settings)
-        .await
-        .map_err(|err| AppError::transcode(format!("hlskit processing failed: {err}")))?;
-
-    write_hls_outputs(storage, id, &profiles, &video).await?;
-
-    if is_temporary {
-        match fs::remove_file(&hlskit_input).await {
-            Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
-                tracing::warn!(
-                    path = %hlskit_input.display(),
-                    ?err,
-                    "failed to remove temporary hlskit input"
-                );
-            }
-            _ => {}
-        }
-    }
-
-    Ok(())
-}
-
-struct HlsProfile {
-    name: &'static str,
-    settings: HlsVideoProcessingSettings,
-}
-
-async fn write_hls_outputs(
-    storage: &Storage,
-    id: &Uuid,
-    profiles: &[HlsProfile],
-    video: &HlsVideo,
-) -> Result<(), AppError> {
-    if video.resolutions.len() != profiles.len() {
-        return Err(AppError::transcode(format!(
-            "hlskit returned {} renditions but {} were requested",
-            video.resolutions.len(),
-            profiles.len()
-        )));
-    }
-
-    let hls_dir = storage.hls_dir(id);
-    ensure_dir(&hls_dir).await?;
-
-    let mut master_playlist = String::from_utf8(video.master_m3u8_data.clone())
-        .map_err(|_| AppError::transcode("hlskit master playlist is not valid UTF-8"))?;
-
-    for (index, profile) in profiles.iter().enumerate() {
-        let source_name = format!("playlist_{index}.m3u8");
-        let replacement = format!("{}/index.m3u8", profile.name);
-        master_playlist = master_playlist.replace(&source_name, &replacement);
-
-        let rendition_dir = hls_dir.join(profile.name);
-        if rendition_dir.exists() {
-            match fs::remove_dir_all(&rendition_dir).await {
-                Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err.into()),
-                _ => {}
-            }
-        }
-        ensure_dir(&rendition_dir).await?;
-
-        let resolution = video
-            .resolutions
-            .get(index)
-            .ok_or_else(|| AppError::transcode("missing HLS resolution payload"))?;
-
-        fs::write(rendition_dir.join("index.m3u8"), &resolution.playlist_data).await?;
-        for segment in &resolution.segments {
-            fs::write(
-                rendition_dir.join(&segment.segment_name),
-                &segment.segment_data,
-            )
-            .await?;
-        }
-    }
-
-    fs::write(hls_dir.join("master.m3u8"), master_playlist.into_bytes()).await?;
-
-    Ok(())
-}
-
-async fn prepare_hlskit_input(
-    storage: &Storage,
-    id: &Uuid,
-    input: &Path,
-) -> Result<(PathBuf, bool), AppError> {
-    const SUPPORTED: [&str; 4] = ["mp4", "mov", "mkv", "avi"];
-
-    let requires_transcode = input
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| !SUPPORTED.contains(&ext.to_ascii_lowercase().as_str()))
-        .unwrap_or(true);
-
-    if !requires_transcode {
-        return Ok((input.to_path_buf(), false));
-    }
-
-    let output = storage
-        .tmp_dir()
-        .join(format!("{}.hlskit.mp4", id.simple()));
-    ensure_parent(&output).await?;
-    if output.exists() {
-        fs::remove_file(&output).await.ok();
-    }
-
-    let mut args = vec![os("-y"), os("-i"), os_path(input)];
     args.extend([
-        os("-c:v"),
-        os("libx264"),
-        os("-preset"),
-        os("medium"),
-        os("-crf"),
-        os("23"),
-        os("-c:a"),
-        os("aac"),
-        os("-b:a"),
-        os("160k"),
+        os("-f"),
+        os("hls"),
+        os("-hls_time"),
+        os(SEGMENT_SECONDS),
+        os("-hls_playlist_type"),
+        os("event"),
+        os("-hls_flags"),
+        os("independent_segments+append_list+omit_endlist"),
+        os("-hls_segment_type"),
+        os("fmp4"),
+        os("-master_pl_name"),
+        os("master.m3u8"),
+        os("-hls_segment_filename"),
+        os_path(&segment_pattern),
+        os_path(&hls_dir.join("index.m3u8")),
     ]);
-    args.push(os_path(&output));
 
-    run_ffmpeg(args).await?;
-
-    Ok((output, true))
+    run_ffmpeg(args).await
 }
 
-fn build_hls_profiles(source_dimensions: (u32, u32)) -> Vec<HlsProfile> {
-    RENDITIONS
-        .iter()
-        .map(|rendition| {
-            let dims = scaled_dimensions(source_dimensions, rendition.height);
-            let settings = HlsVideoProcessingSettings::new(
-                dims,
-                28,
-                Some(HlsVideoAudioCodec::Aac),
-                Some(map_audio_bitrate(rendition.audio_bitrate)),
-                FfmpegVideoProcessingPreset::Medium,
-            );
-            HlsProfile {
-                name: rendition.name,
-                settings,
-            }
-        })
-        .collect()
-}
-
-fn scaled_dimensions(source: (u32, u32), target_height: u32) -> (i32, i32) {
-    let (source_width, source_height) = source;
-    if source_width == 0 || source_height == 0 {
-        let width = (target_height as f64 * 16.0 / 9.0).round() as i32;
-        return (ensure_even(width.max(2)), target_height as i32);
-    }
-
-    let ratio = source_width as f64 / source_height as f64;
-    let mut width = (ratio * target_height as f64).round() as i32;
-    if width <= 0 {
-        width = (target_height as f64 * 16.0 / 9.0).round() as i32;
-    }
-    if width % 2 != 0 {
-        width += 1;
-    }
-    (width.max(2), target_height as i32)
-}
-
-fn map_audio_bitrate(value: &str) -> HlsVideoAudioBitrate {
-    match value {
-        "192k" => HlsVideoAudioBitrate::High,
-        "160k" => HlsVideoAudioBitrate::High,
-        "128k" => HlsVideoAudioBitrate::Medium,
-        _ => HlsVideoAudioBitrate::Low,
-    }
-}
-
-fn ensure_even(value: i32) -> i32 {
-    if value % 2 == 0 { value } else { value + 1 }
-}
-
-async fn generate_dash(
+async fn generate_dash_stream(
     storage: &Storage,
     id: &Uuid,
-    input: &Path,
+    source: &Path,
     has_audio: bool,
 ) -> Result<(), AppError> {
     let dash_dir = storage.dash_dir(id);
     let manifest = dash_dir.join("manifest.mpd");
     ensure_parent(&manifest).await?;
 
-    let filter_complex = build_filter_complex();
-
     let mut args = vec![
         os("-y"),
         os("-i"),
-        os_path(input),
-        os("-filter_complex"),
-        os(filter_complex),
+        os_path(source),
+        os("-map"),
+        os("0"),
+        os("-c:v"),
+        os("copy"),
     ];
 
-    for (idx, rendition) in RENDITIONS.iter().enumerate() {
-        let video_label = format!("[v{idx}out]");
-        args.extend([os("-map"), os(video_label)]);
-
-        args.extend([
-            os(format!("-c:v:{idx}")),
-            os("libaom-av1"),
-            os(format!("-b:v:{idx}")),
-            os(rendition.video_bitrate),
-            os(format!("-maxrate:v:{idx}")),
-            os(rendition.maxrate),
-            os(format!("-bufsize:v:{idx}")),
-            os(rendition.bufsize),
-            os(format!("-g:v:{idx}")),
-            os(GOP_LENGTH),
-            os(format!("-keyint_min:v:{idx}")),
-            os(GOP_LENGTH),
-            os(format!("-cpu-used:v:{idx}")),
-            os("6"),
-            os(format!("-pix_fmt:v:{idx}")),
-            os("yuv420p"),
-        ]);
-
-        if has_audio {
-            args.extend([os("-map"), os("a:0")]);
-            args.extend([
-                os(format!("-c:a:{idx}")),
-                os("libopus"),
-                os(format!("-b:a:{idx}")),
-                os(rendition.audio_bitrate),
-            ]);
-        }
+    if has_audio {
+        args.extend([os("-c:a"), os("copy")]);
+    } else {
+        args.push(os("-an"));
     }
+
+    let adaptation_sets = if has_audio {
+        "id=0,streams=v id=1,streams=a"
+    } else {
+        "id=0,streams=v"
+    };
 
     args.extend([
         os("-f"),
@@ -503,38 +395,72 @@ async fn generate_dash(
         os("1"),
         os("-use_timeline"),
         os("1"),
+        os("-streaming"),
+        os("1"),
+        os("-remove_at_exit"),
+        os("0"),
+        os("-adaptation_sets"),
+        os(adaptation_sets),
         os("-init_seg_name"),
         os("init_$RepresentationID$.m4s"),
         os("-media_seg_name"),
         os("chunk_$RepresentationID$_$Number$.m4s"),
-        os("-dash_segment_type"),
-        os("mp4"),
+        os_path(&manifest),
     ]);
-
-    if has_audio {
-        args.extend([os("-adaptation_sets"), os("id=0,streams=v id=1,streams=a")]);
-    } else {
-        args.extend([os("-adaptation_sets"), os("id=0,streams=v")]);
-    }
-
-    args.push(os(manifest));
 
     run_ffmpeg(args).await
 }
 
-fn build_filter_complex() -> String {
-    let mut parts = Vec::new();
-    let mut split = format!("[0:v]split={}", RENDITIONS.len());
-    for idx in 0..RENDITIONS.len() {
-        split.push_str(&format!("[v{idx}]"));
-    }
-    parts.push(split);
+fn encoder_from_env() -> Option<EncoderKind> {
+    env::var("VIDEO_SERVER_ENCODER").ok().and_then(|value| {
+        match value.to_ascii_lowercase().as_str() {
+            "videotoolbox" | "vt" => Some(EncoderKind::VideoToolboxAv1),
+            "nvenc" | "cuda" => Some(EncoderKind::NvencAv1),
+            "qsv" | "quicksync" => Some(EncoderKind::QsvAv1),
+            "vaapi" => Some(EncoderKind::VaapiAv1),
+            "software" | "cpu" => Some(EncoderKind::SoftwareAv1),
+            _ => None,
+        }
+    })
+}
 
-    for (idx, rendition) in RENDITIONS.iter().enumerate() {
-        parts.push(format!("[v{idx}]scale=-2:{}[v{idx}out]", rendition.height));
+fn encoder_candidates(explicit: Option<EncoderKind>) -> Vec<EncoderKind> {
+    let mut order = Vec::new();
+    if let Some(kind) = explicit.or_else(encoder_from_env) {
+        order.push(kind);
+    } else {
+        #[cfg(target_os = "macos")]
+        {
+            order.push(EncoderKind::VideoToolboxAv1);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            order.push(EncoderKind::NvencAv1);
+            order.push(EncoderKind::QsvAv1);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            order.push(EncoderKind::VaapiAv1);
+            order.push(EncoderKind::NvencAv1);
+        }
     }
+    order.push(EncoderKind::SoftwareAv1);
+    order.sort_unstable();
+    order.dedup();
+    order
+}
 
-    parts.join(";")
+#[derive(Clone)]
+struct FfmpegProgressConfig {
+    total_duration: Duration,
+    jobs: DynJobStore,
+    job_id: Uuid,
+    operation: &'static str,
+}
+
+struct FfmpegMetrics {
+    time_seconds: f64,
+    speed: Option<f64>,
 }
 
 async fn probe_has_audio(input: &Path) -> Result<bool, AppError> {
@@ -560,51 +486,6 @@ async fn probe_has_audio(input: &Path) -> Result<bool, AppError> {
     }
 
     Ok(!output.stdout.is_empty())
-}
-
-async fn probe_dimensions(input: &Path) -> Result<(u32, u32), AppError> {
-    let output = Command::new(FFPROBE_BIN)
-        .arg("-v")
-        .arg("error")
-        .arg("-select_streams")
-        .arg("v:0")
-        .arg("-show_entries")
-        .arg("stream=width,height")
-        .arg("-of")
-        .arg("csv=p=0:s=x")
-        .arg(input)
-        .output()
-        .await
-        .map_err(map_io_error)?;
-
-    if !output.status.success() {
-        tracing::warn!(
-            status = %output.status,
-            "ffprobe did not return video dimensions, using defaults"
-        );
-        return Ok(DEFAULT_DIMENSIONS);
-    }
-
-    let text = String::from_utf8_lossy(&output.stdout);
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        tracing::warn!("ffprobe returned empty dimensions, using defaults");
-        return Ok(DEFAULT_DIMENSIONS);
-    }
-
-    let mut parts = trimmed.split('x');
-    let width = parts
-        .next()
-        .and_then(|part| part.parse::<u32>().ok())
-        .filter(|width| *width > 0)
-        .unwrap_or(DEFAULT_DIMENSIONS.0);
-    let height = parts
-        .next()
-        .and_then(|part| part.parse::<u32>().ok())
-        .filter(|height| *height > 0)
-        .unwrap_or(DEFAULT_DIMENSIONS.1);
-
-    Ok((width, height))
 }
 
 async fn probe_duration(input: &Path) -> Result<Option<Duration>, AppError> {
@@ -695,32 +576,6 @@ async fn run_ffmpeg_inner(
     }
 
     Ok(())
-}
-
-const PROGRESS_EPSILON: f32 = 0.005;
-const MAX_PROGRESS_UPDATE_INTERVAL: Duration = Duration::from_secs(3);
-const PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(10);
-
-struct FfmpegProgressConfig {
-    total_duration: Duration,
-    jobs: DynJobStore,
-    job_id: Uuid,
-    operation: &'static str,
-}
-
-struct FfmpegMetrics {
-    time_seconds: f64,
-    speed: Option<f64>,
-}
-
-struct ProgressContext<'a> {
-    jobs: &'a DynJobStore,
-    job_id: Uuid,
-    total_seconds: f64,
-    last_reported: &'a mut f32,
-    last_update: &'a mut Instant,
-    last_log: &'a mut Instant,
-    operation: &'static str,
 }
 
 async fn monitor_ffmpeg(
@@ -819,8 +674,19 @@ async fn monitor_ffmpeg(
     if last_reported < 1.0 - PROGRESS_EPSILON {
         jobs.update_progress(job_id, 1.0).await?;
     }
+    jobs.update_stage_eta(job_id, Some(0.0)).await?;
 
     Ok(())
+}
+
+struct ProgressContext<'a> {
+    jobs: &'a DynJobStore,
+    job_id: Uuid,
+    total_seconds: f64,
+    last_reported: &'a mut f32,
+    last_update: &'a mut Instant,
+    last_log: &'a mut Instant,
+    operation: &'static str,
 }
 
 async fn process_ffmpeg_line(line: &str, ctx: ProgressContext<'_>) -> Result<(), AppError> {
@@ -834,6 +700,19 @@ async fn process_ffmpeg_line(line: &str, ctx: ProgressContext<'_>) -> Result<(),
         let ratio = (metrics.time_seconds / ctx.total_seconds).clamp(0.0, 1.0) as f32;
         if ratio < *ctx.last_reported {
             return Ok(());
+        }
+
+        if let Some(speed) = metrics.speed {
+            let eta_seconds = if speed > 0.0 {
+                (ctx.total_seconds - metrics.time_seconds).max(0.0) / speed
+            } else {
+                f64::INFINITY
+            };
+            ctx.jobs
+                .update_stage_eta(ctx.job_id, Some(eta_seconds))
+                .await?;
+        } else {
+            ctx.jobs.update_stage_eta(ctx.job_id, None).await?;
         }
 
         let delta = ratio - *ctx.last_reported;
@@ -859,7 +738,7 @@ async fn process_ffmpeg_line(line: &str, ctx: ProgressContext<'_>) -> Result<(),
                 let eta_str = format_eta(eta_seconds);
                 tracing::info!(
                     operation = %ctx.operation,
-                    progress_percent = (ratio * 100.0).clamp(0.0, 100.0),
+                    progress = ratio,
                     speed = speed,
                     eta = %eta_str,
                     "ffmpeg progress"
@@ -867,7 +746,7 @@ async fn process_ffmpeg_line(line: &str, ctx: ProgressContext<'_>) -> Result<(),
             } else {
                 tracing::info!(
                     operation = %ctx.operation,
-                    progress_percent = (ratio * 100.0).clamp(0.0, 100.0),
+                    progress = ratio,
                     "ffmpeg progress"
                 );
             }
@@ -975,8 +854,43 @@ fn os_path(path: &Path) -> OsString {
 #[cfg(test)]
 mod tests {
     use super::*;
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/unit/transcode_unit.rs"
-    ));
+
+    #[test]
+    fn encode_params_sanitized_clamps_values() {
+        let params = EncodeParams {
+            crf: 200,
+            cpu_used: 99,
+            encoder: None,
+        }
+        .sanitized();
+        assert_eq!(params.crf, 63);
+        assert_eq!(params.cpu_used, 8);
+
+        let params = EncodeParams {
+            crf: 0,
+            cpu_used: 0,
+            encoder: None,
+        }
+        .sanitized();
+        assert_eq!(params.crf, 0);
+        assert_eq!(params.cpu_used, 0);
+    }
+
+    #[test]
+    fn encoder_candidates_include_software() {
+        let list = encoder_candidates(None);
+        assert!(list.contains(&EncoderKind::SoftwareAv1));
+    }
+
+    #[test]
+    fn encoder_candidates_respect_explicit() {
+        let list = encoder_candidates(Some(EncoderKind::SoftwareAv1));
+        assert_eq!(list.first(), Some(&EncoderKind::SoftwareAv1));
+    }
+
+    #[test]
+    fn parse_speed_handles_cases() {
+        assert_eq!(parse_speed("2.5x"), Some(2.5));
+        assert!(parse_speed("N/A").is_none());
+    }
 }

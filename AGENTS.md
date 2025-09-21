@@ -13,6 +13,8 @@
 - `cargo clippy --all-targets --all-features -- -D warnings` – keep the codebase lint-clean; CI treats all warnings as errors.
 - `cargo test --lib` & `cargo test --test api` – unit suites that must pass locally before pushing; GitHub Actions executes both on every push/PR.
 - `cargo test` – convenience wrapper that runs the entire test suite (unit + API).
+- Hardware encode defaults: set `VIDEO_SERVER_ENCODER` (`videotoolbox`, `nvenc`, `qsv`, `vaapi`, `software`) when you want to override auto-detected ffmpeg GPU usage. Optional `VIDEO_VAAPI_DEVICE` points to the VA-API render node on Linux.
+- HLS/DASH assets are generated on-the-fly via ffmpeg (`ffmpeg` must be on `$PATH`); segments are written to the system temp directory and become available as soon as they are produced.
 
 ### Continuous Integration
 - GitHub Actions workflow lives in `.github/workflows/ci.yml`; it runs `cargo fmt --check`, full clippy, and the unit/API tests on each push and pull request.
