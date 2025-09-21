@@ -25,8 +25,8 @@
 - Run `cargo fmt` prior to commits to maintain canonical formatting.
 
 ## Testing Guidelines
-- All automated tests must live under `tests/`; do not add `#[cfg(test)]` modules inside production source files.
-- Organize scenarios by feature, arrange fixtures under `tests/fixtures/`, and gate external resources behind feature flags.
+- Co-locate fast unit tests inside the relevant module using `#[cfg(test)]` blocks; prefer reusing shared helpers over duplicating logic.
+- Use `tests/` for higher-level or multi-module scenarios; arrange fixtures under `tests/fixtures/`, and gate external resources behind feature flags.
 - Aim for meaningful branch coverage on critical flows; add regression tests for every bug fix.
 
 ## Commit & Pull Request Guidelines
