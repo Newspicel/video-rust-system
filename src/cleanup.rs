@@ -126,12 +126,3 @@ fn disk_status(path: &Path) -> Result<DiskStatus, AppError> {
         free_bytes,
     })
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/unit/cleanup_unit.rs"
-    ));
-}

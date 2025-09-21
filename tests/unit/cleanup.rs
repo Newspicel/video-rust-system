@@ -1,10 +1,12 @@
-use crate::jobs::{DynJobStore, JobStage, LocalJobStore};
-use crate::error::AppError;
-use crate::storage::ensure_dir;
+use std::env;
 use std::sync::{Arc, Mutex, OnceLock};
 use tempfile::tempdir;
 use tokio::fs;
 use uuid::Uuid;
+use vrs::cleanup::{CleanupConfig, ensure_capacity};
+use vrs::error::AppError;
+use vrs::jobs::{DynJobStore, JobStage, LocalJobStore};
+use vrs::storage::{Storage, ensure_dir};
 
 static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -27,20 +29,22 @@ fn config_from_env_overrides_defaults() {
     assert!((config.minimum_free_ratio - 0.25).abs() < f32::EPSILON);
     assert_eq!(config.max_cleanup_batch, 2);
 
-    if let Some(value) = prev_bytes {
-        unsafe { env::set_var("VIDEO_STORAGE_MIN_FREE_BYTES", value) };
-    } else {
-        unsafe { env::remove_var("VIDEO_STORAGE_MIN_FREE_BYTES") };
-    }
-    if let Some(value) = prev_ratio {
-        unsafe { env::set_var("VIDEO_STORAGE_MIN_FREE_RATIO", value) };
-    } else {
-        unsafe { env::remove_var("VIDEO_STORAGE_MIN_FREE_RATIO") };
-    }
-    if let Some(value) = prev_batch {
-        unsafe { env::set_var("VIDEO_STORAGE_CLEANUP_BATCH", value) };
-    } else {
-        unsafe { env::remove_var("VIDEO_STORAGE_CLEANUP_BATCH") };
+    unsafe {
+        if let Some(value) = prev_bytes {
+            env::set_var("VIDEO_STORAGE_MIN_FREE_BYTES", value);
+        } else {
+            env::remove_var("VIDEO_STORAGE_MIN_FREE_BYTES");
+        }
+        if let Some(value) = prev_ratio {
+            env::set_var("VIDEO_STORAGE_MIN_FREE_RATIO", value);
+        } else {
+            env::remove_var("VIDEO_STORAGE_MIN_FREE_RATIO");
+        }
+        if let Some(value) = prev_batch {
+            env::set_var("VIDEO_STORAGE_CLEANUP_BATCH", value);
+        } else {
+            env::remove_var("VIDEO_STORAGE_CLEANUP_BATCH");
+        }
     }
 
     drop(lock);

@@ -1,8 +1,8 @@
-use crate::error::AppError;
-use crate::storage::{ensure_dir, Storage};
 use std::env;
 use tempfile::tempdir;
 use uuid::Uuid;
+use vrs::error::AppError;
+use vrs::storage::{Storage, ensure_dir};
 
 #[tokio::test]
 async fn initialize_sets_up_directories() -> Result<(), AppError> {

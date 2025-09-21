@@ -68,12 +68,3 @@ impl AppError {
         Self::Transcode(message.to_string())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/unit/error_unit.rs"
-    ));
-}

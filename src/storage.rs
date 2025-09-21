@@ -135,11 +135,3 @@ pub async fn ensure_parent(path: &Path) -> Result<(), AppError> {
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/unit/storage_unit.rs"
-    ));
-}

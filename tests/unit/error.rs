@@ -1,5 +1,6 @@
-use crate::error::AppError;
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use vrs::error::AppError;
 
 #[test]
 fn into_response_sets_http_status() {

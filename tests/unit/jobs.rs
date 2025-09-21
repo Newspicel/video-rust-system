@@ -1,6 +1,7 @@
-use crate::error::AppError;
-use crate::jobs::{JobStage, LocalJobStore};
 use uuid::Uuid;
+use vrs::error::AppError;
+use vrs::jobs::JobStore;
+use vrs::{JobStage, LocalJobStore};
 
 #[tokio::test]
 async fn local_job_store_lifecycle() -> Result<(), AppError> {
@@ -31,10 +32,7 @@ async fn local_job_store_lifecycle() -> Result<(), AppError> {
 
     store.update_progress(id, 1.5).await?; // clamp to 1.0
 
-    let downloading_complete = store
-        .status(&id)
-        .await?
-        .expect("job missing after clamp");
+    let downloading_complete = store.status(&id).await?.expect("job missing after clamp");
     assert_eq!(downloading_complete.stage, JobStage::Downloading);
     assert!((downloading_complete.stage_progress - 1.0).abs() < f32::EPSILON);
     assert!((downloading_complete.progress - 0.5).abs() < f32::EPSILON);
@@ -42,7 +40,10 @@ async fn local_job_store_lifecycle() -> Result<(), AppError> {
     store.update_stage(id, JobStage::Transcoding).await?;
     store.update_progress(id, 0.4).await?;
 
-    let transcoding = store.status(&id).await?.expect("job missing after stage change");
+    let transcoding = store
+        .status(&id)
+        .await?
+        .expect("job missing after stage change");
     assert_eq!(transcoding.stage, JobStage::Transcoding);
     assert!((transcoding.stage_progress - 0.4).abs() < f32::EPSILON);
     assert!((transcoding.progress - 0.7).abs() < f32::EPSILON);

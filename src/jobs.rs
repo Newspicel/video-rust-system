@@ -326,12 +326,3 @@ pub struct JobStatusResponse {
     pub started_at_unix_ms: u128,
     pub last_update_unix_ms: u128,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/unit/jobs_unit.rs"
-    ));
-}
