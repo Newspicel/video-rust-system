@@ -68,3 +68,48 @@ pub(crate) async fn probe_duration(input: &Path) -> Result<Option<Duration>, App
     tracing::warn!("ffprobe returned an unexpected duration value");
     Ok(None)
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VideoGeometry {
+    pub width: u32,
+    pub height: u32,
+}
+
+pub(crate) async fn probe_video_geometry(input: &Path) -> Result<VideoGeometry, AppError> {
+    let output = Command::new(FFPROBE_BIN)
+        .arg("-v")
+        .arg("error")
+        .arg("-select_streams")
+        .arg("v:0")
+        .arg("-show_entries")
+        .arg("stream=width,height")
+        .arg("-of")
+        .arg("csv=p=0:s=x")
+        .arg(input)
+        .output()
+        .await
+        .map_err(map_io_error)?;
+
+    if !output.status.success() {
+        return Err(AppError::transcode(format!(
+            "ffprobe exited with status {} while probing video geometry",
+            output.status
+        )));
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let value = text.trim();
+    let mut parts = value.split('x');
+    let width = parts.next().and_then(|raw| raw.trim().parse::<u32>().ok());
+    let height = parts.next().and_then(|raw| raw.trim().parse::<u32>().ok());
+
+    match (width, height) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => Ok(VideoGeometry {
+            width: w,
+            height: h,
+        }),
+        _ => Err(AppError::transcode(
+            "ffprobe did not report video dimensions",
+        )),
+    }
+}

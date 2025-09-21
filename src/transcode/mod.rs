@@ -2,7 +2,7 @@ mod config;
 mod ffmpeg;
 mod pipeline;
 mod probe;
-mod streams;
+pub mod streams;
 mod util;
 
 pub use config::EncodeParams;

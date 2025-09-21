@@ -12,8 +12,8 @@ use crate::{
 use super::{
     config::{EncodeParams, EncoderKind, encoder_candidates},
     ffmpeg::{FfmpegProgressConfig, run_ffmpeg, run_ffmpeg_with_progress},
-    probe::{probe_duration, probe_has_audio},
-    streams::{generate_dash_stream, generate_hls_stream},
+    probe::{probe_duration, probe_has_audio, probe_video_geometry},
+    streams::{generate_dash_stream, generate_hls_stream, select_renditions},
     util::{finalize_encoded_file, os, os_path},
 };
 
@@ -55,6 +55,9 @@ pub async fn process_video(
 
     finalize_encoded_file(&tmp_output, &download_path).await?;
 
+    let geometry = probe_video_geometry(&download_path).await?;
+    let renditions = select_renditions(geometry);
+
     match fs::remove_file(input).await {
         Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
             tracing::warn!(path = %input.display(), ?err, "failed to remove temporary input file");
@@ -73,17 +76,31 @@ pub async fn process_video(
     let download_for_dash = download_path.clone();
 
     tokio::try_join!(
-        async move {
-            generate_hls_stream(&storage_for_hls, &id_for_hls, &download_for_hls, has_audio).await
+        {
+            let renditions = renditions.clone();
+            async move {
+                generate_hls_stream(
+                    &storage_for_hls,
+                    &id_for_hls,
+                    &download_for_hls,
+                    has_audio,
+                    renditions,
+                )
+                .await
+            }
         },
-        async move {
-            generate_dash_stream(
-                &storage_for_dash,
-                &id_for_dash,
-                &download_for_dash,
-                has_audio,
-            )
-            .await
+        {
+            let renditions = renditions.clone();
+            async move {
+                generate_dash_stream(
+                    &storage_for_dash,
+                    &id_for_dash,
+                    &download_for_dash,
+                    has_audio,
+                    renditions,
+                )
+                .await
+            }
         },
     )?;
 
@@ -108,7 +125,9 @@ pub async fn ensure_hls_ready(storage: &Storage, id: &Uuid) -> Result<(), AppErr
     }
 
     let has_audio = probe_has_audio(&source).await.unwrap_or(false);
-    generate_hls_stream(storage, id, &source, has_audio).await
+    let geometry = probe_video_geometry(&source).await?;
+    let renditions = select_renditions(geometry);
+    generate_hls_stream(storage, id, &source, has_audio, renditions).await
 }
 
 pub async fn ensure_dash_ready(storage: &Storage, id: &Uuid) -> Result<(), AppError> {
@@ -126,7 +145,9 @@ pub async fn ensure_dash_ready(storage: &Storage, id: &Uuid) -> Result<(), AppEr
     }
 
     let has_audio = probe_has_audio(&source).await.unwrap_or(false);
-    generate_dash_stream(storage, id, &source, has_audio).await
+    let geometry = probe_video_geometry(&source).await?;
+    let renditions = select_renditions(geometry);
+    generate_dash_stream(storage, id, &source, has_audio, renditions).await
 }
 
 async fn encode_download(
