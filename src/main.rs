@@ -2,9 +2,12 @@ use std::{env, net::SocketAddr, sync::Arc};
 
 use axum::{
     Router,
+    http::Request,
     routing::{get, post},
 };
 use tower_http::cors::CorsLayer;
+use tower_http::trace::{DefaultOnRequest, DefaultOnResponse, TraceLayer};
+use tracing::Level;
 use vrs::{
     cleanup::CleanupConfig,
     handlers,
@@ -36,6 +39,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cors = CorsLayer::permissive();
 
+    let trace_layer = TraceLayer::new_for_http()
+        .make_span_with(|request: &Request<_>| {
+            tracing::span!(
+                Level::DEBUG,
+                "http_request",
+                method = %request.method(),
+                uri = %request.uri(),
+                version = ?request.version()
+            )
+        })
+        .on_request(DefaultOnRequest::new().level(Level::DEBUG))
+        .on_response(DefaultOnResponse::new().level(Level::DEBUG));
+
     let app = Router::new()
         .route("/healthz", get(health))
         .route("/upload/multipart", post(handlers::upload_multipart))
@@ -47,7 +63,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/videos/{id}/dash/{*asset}", get(handlers::get_dash_asset))
         .route("/jobs/{id}", get(handlers::job_status))
         .with_state(state)
-        .layer(cors);
+        .layer(cors)
+        .layer(trace_layer);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "video server listening");

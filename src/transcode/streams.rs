@@ -239,7 +239,9 @@ pub(crate) async fn generate_hls_stream(
 
     let index_playlist = hls_dir.join("index.m3u8");
     if !index_playlist.exists() {
-        return Err(AppError::transcode("ffmpeg did not produce an HLS master playlist"));
+        return Err(AppError::transcode(
+            "ffmpeg did not produce an HLS master playlist",
+        ));
     }
 
     let master_playlist = hls_dir.join("master.m3u8");
