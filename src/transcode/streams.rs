@@ -26,7 +26,7 @@ const AUDIO_BITRATE: &str = "192k";
 const AUDIO_CHANNELS: &str = "2";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Rendition {
+pub(crate) struct Rendition {
     pub name: String,
     pub width: u32,
     pub height: u32,
@@ -428,35 +428,121 @@ fn build_var_stream_map(renditions: &[Rendition], has_audio: bool) -> String {
     entries.join(" ")
 }
 
-#[doc(hidden)]
-pub mod inspect {
-    use super::{
-        Rendition, VideoGeometry, build_filter_complex, build_var_stream_map, estimate_bitrates,
-        select_renditions,
-    };
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct GeometryInput {
-        pub width: u32,
-        pub height: u32,
+    fn ladder_heights(renditions: &[Rendition]) -> Vec<u32> {
+        renditions.iter().map(|rung| rung.height).collect()
     }
 
-    pub fn renditions(input: GeometryInput) -> Vec<Rendition> {
-        select_renditions(VideoGeometry {
-            width: input.width,
-            height: input.height,
-        })
+    fn sample_renditions() -> Vec<Rendition> {
+        vec![
+            Rendition {
+                name: "1080p".into(),
+                width: 1920,
+                height: 1080,
+                bitrate: 6000,
+                maxrate: 6500,
+                bufsize: 8000,
+            },
+            Rendition {
+                name: "720p".into(),
+                width: 1280,
+                height: 720,
+                bitrate: 3000,
+                maxrate: 3500,
+                bufsize: 4000,
+            },
+        ]
     }
 
-    pub fn filter_complex(renditions: &[Rendition]) -> String {
-        build_filter_complex(renditions)
+    #[test]
+    fn ultrawide_source_produces_descending_unique_even_rungs() {
+        let geometry = VideoGeometry {
+            width: 5120,
+            height: 2160,
+        };
+
+        let renditions = select_renditions(geometry);
+        assert!(!renditions.is_empty());
+        assert!(renditions.len() <= MAX_RENDITIONS);
+        assert_eq!(renditions[0].width, 5120);
+        assert_eq!(renditions[0].height, 2160);
+
+        let mut last_height = u32::MAX;
+        let mut seen = std::collections::HashSet::new();
+        for rung in renditions {
+            assert!(rung.width <= 5120);
+            assert!(rung.height <= 2160);
+            assert!(rung.width.is_multiple_of(2));
+            assert!(rung.height.is_multiple_of(2));
+            assert!(rung.height <= last_height);
+            assert!(seen.insert((rung.width, rung.height)));
+            last_height = rung.height;
+        }
     }
 
-    pub fn var_stream_map(renditions: &[Rendition], has_audio: bool) -> String {
-        build_var_stream_map(renditions, has_audio)
+    #[test]
+    fn sixteen_nine_source_matches_expected_ladder() {
+        let geometry = VideoGeometry {
+            width: 1920,
+            height: 1080,
+        };
+
+        let renditions = select_renditions(geometry);
+        assert_eq!(ladder_heights(&renditions), vec![1080, 900, 720, 540, 480]);
+        for rung in renditions {
+            assert!(rung.width <= 1920);
+            assert!(rung.width.is_multiple_of(2));
+        }
     }
 
-    pub fn bitrates(width: u32, height: u32) -> (u32, u32, u32) {
-        estimate_bitrates(width, height)
+    #[test]
+    fn tall_video_keeps_vertical_ladder() {
+        let geometry = VideoGeometry {
+            width: 1080,
+            height: 1920,
+        };
+
+        let renditions = select_renditions(geometry);
+        assert_eq!(
+            ladder_heights(&renditions),
+            vec![1920, 1600, 1440, 1200, 1080]
+        );
+        for rung in renditions {
+            assert!(rung.width <= 1080);
+        }
+    }
+
+    #[test]
+    fn filter_complex_matches_expected_layout() {
+        let filter = build_filter_complex(&sample_renditions());
+        assert_eq!(
+            filter,
+            "[0:v]scale=-2:1080:flags=lanczos[v0];[0:v]scale=-2:720:flags=lanczos[v1]"
+        );
+    }
+
+    #[test]
+    fn var_stream_map_handles_audio_and_video() {
+        let renditions = sample_renditions();
+        let with_audio = build_var_stream_map(&renditions, true);
+        assert_eq!(with_audio, "v:0,a:0,name:1080p v:1,a:0,name:720p");
+
+        let without_audio = build_var_stream_map(&renditions, false);
+        assert_eq!(without_audio, "v:0,name:1080p v:1,name:720p");
+    }
+
+    #[test]
+    fn bitrate_estimates_scale_with_resolution() {
+        let high = estimate_bitrates(1920, 1080);
+        let mid = estimate_bitrates(1280, 720);
+        let low = estimate_bitrates(640, 360);
+
+        assert!(high.0 > mid.0);
+        assert!(high.1 > mid.1);
+        assert!(high.2 > mid.2);
+        assert!(mid.0 > low.0);
     }
 }
