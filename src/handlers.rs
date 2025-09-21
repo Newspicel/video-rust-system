@@ -393,10 +393,11 @@ fn spawn_local_pipeline(state: AppState, id: Uuid, temp_path: PathBuf) {
             if let Err(store_err) = state.jobs.fail(id, err.to_string()).await {
                 tracing::error!(%id, error = %store_err, "failed to mark job as failed");
             }
-            if let Err(e) = tokio::fs::remove_file(&temp_path).await {
-                if e.kind() != std::io::ErrorKind::NotFound {
+            match tokio::fs::remove_file(&temp_path).await {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
                     tracing::warn!(path = %temp_path.display(), ?e, "cleanup failed");
                 }
+                _ => {}
             }
         }
     });
@@ -555,15 +556,6 @@ fn binary_name(base: &str) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/unit/handlers_unit.rs"
-    ));
-}
-
 async fn install_ytdlp_binaries(
     libs_dir: PathBuf,
     output_dir: PathBuf,
@@ -575,4 +567,13 @@ async fn install_ytdlp_binaries(
     .await
     .map_err(|err| AppError::dependency(format!("yt-dlp installer task panicked: {err}")))?
     .map_err(|err| AppError::dependency(format!("failed to install yt-dlp binaries: {err}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/unit/handlers_unit.rs"
+    ));
 }

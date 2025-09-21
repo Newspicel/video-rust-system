@@ -35,6 +35,12 @@ impl LocalJobStore {
     }
 }
 
+impl Default for LocalJobStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
 impl JobStore for LocalJobStore {
     async fn create_job(&self, id: Uuid) -> Result<(), AppError> {
@@ -177,7 +183,7 @@ impl JobRecord {
             id,
             stage: self.stage,
             progress: overall_progress,
-            stage_progress: stage_progress,
+            stage_progress,
             current_stage_index: stage_index,
             total_stages,
             elapsed_seconds,

@@ -126,10 +126,11 @@ pub async fn process_video(
         jobs.update_progress(*id, 1.0).await?;
     }
 
-    if let Err(err) = fs::remove_file(input).await {
-        if err.kind() != std::io::ErrorKind::NotFound {
+    match fs::remove_file(input).await {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
             tracing::warn!(path = %input.display(), ?err, "failed to remove temporary input file");
         }
+        _ => {}
     }
 
     Ok(())
@@ -269,10 +270,15 @@ async fn generate_hls(
     write_hls_outputs(storage, id, &profiles, &video).await?;
 
     if is_temporary {
-        if let Err(err) = fs::remove_file(&hlskit_input).await {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(path = %hlskit_input.display(), ?err, "failed to remove temporary hlskit input");
+        match fs::remove_file(&hlskit_input).await {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+                tracing::warn!(
+                    path = %hlskit_input.display(),
+                    ?err,
+                    "failed to remove temporary hlskit input"
+                );
             }
+            _ => {}
         }
     }
 
@@ -311,10 +317,9 @@ async fn write_hls_outputs(
 
         let rendition_dir = hls_dir.join(profile.name);
         if rendition_dir.exists() {
-            if let Err(err) = fs::remove_dir_all(&rendition_dir).await {
-                if err.kind() != std::io::ErrorKind::NotFound {
-                    return Err(err.into());
-                }
+            match fs::remove_dir_all(&rendition_dir).await {
+                Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err.into()),
+                _ => {}
             }
         }
         ensure_dir(&rendition_dir).await?;
@@ -627,12 +632,11 @@ async fn probe_duration(input: &Path) -> Result<Option<Duration>, AppError> {
         .map(str::trim)
         .filter(|line| !line.is_empty());
 
-    if let Some(value) = duration_str {
-        if let Ok(seconds) = value.parse::<f64>() {
-            if seconds.is_finite() && seconds > 0.0 {
-                return Ok(Some(Duration::from_secs_f64(seconds)));
-            }
-        }
+    if let Some(seconds) = duration_str
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+    {
+        return Ok(Some(Duration::from_secs_f64(seconds)));
     }
 
     tracing::warn!("ffprobe returned an unexpected duration value");
@@ -657,18 +661,18 @@ async fn run_ffmpeg_inner(
     let mut command = Command::new(FFMPEG_BIN);
     command.args(&args);
 
-    if progress.is_some() {
+    let mut progress_opt = progress;
+    if progress_opt.is_some() {
         command.stderr(Stdio::piped());
     }
 
     let mut child = command.spawn().map_err(map_io_error)?;
-    let mut progress_handle = None;
-
-    if let Some(config) = progress {
-        if let Some(stderr) = child.stderr.take() {
-            progress_handle = Some(tokio::spawn(monitor_ffmpeg(stderr, config)));
-        }
-    }
+    let progress_handle = progress_opt.take().and_then(|config| {
+        child
+            .stderr
+            .take()
+            .map(|stderr| tokio::spawn(monitor_ffmpeg(stderr, config)))
+    });
 
     let status = child.wait().await.map_err(map_io_error)?;
 
@@ -707,6 +711,16 @@ struct FfmpegProgressConfig {
 struct FfmpegMetrics {
     time_seconds: f64,
     speed: Option<f64>,
+}
+
+struct ProgressContext<'a> {
+    jobs: &'a DynJobStore,
+    job_id: Uuid,
+    total_seconds: f64,
+    last_reported: &'a mut f32,
+    last_update: &'a mut Instant,
+    last_log: &'a mut Instant,
+    operation: &'static str,
 }
 
 async fn monitor_ffmpeg(
@@ -771,13 +785,15 @@ async fn monitor_ffmpeg(
             let line = String::from_utf8_lossy(&line_bytes);
             process_ffmpeg_line(
                 line.trim(),
-                &jobs,
-                job_id,
-                total_seconds,
-                &mut last_reported,
-                &mut last_update,
-                &mut last_log,
-                operation,
+                ProgressContext {
+                    jobs: &jobs,
+                    job_id,
+                    total_seconds,
+                    last_reported: &mut last_reported,
+                    last_update: &mut last_update,
+                    last_log: &mut last_log,
+                    operation,
+                },
             )
             .await?;
         }
@@ -787,13 +803,15 @@ async fn monitor_ffmpeg(
         let line = String::from_utf8_lossy(&buffer);
         process_ffmpeg_line(
             line.trim(),
-            &jobs,
-            job_id,
-            total_seconds,
-            &mut last_reported,
-            &mut last_update,
-            &mut last_log,
-            operation,
+            ProgressContext {
+                jobs: &jobs,
+                job_id,
+                total_seconds,
+                last_reported: &mut last_reported,
+                last_update: &mut last_update,
+                last_log: &mut last_log,
+                operation,
+            },
         )
         .await?;
     }
@@ -805,51 +823,42 @@ async fn monitor_ffmpeg(
     Ok(())
 }
 
-async fn process_ffmpeg_line(
-    line: &str,
-    jobs: &DynJobStore,
-    job_id: Uuid,
-    total_seconds: f64,
-    last_reported: &mut f32,
-    last_update: &mut Instant,
-    last_log: &mut Instant,
-    operation: &'static str,
-) -> Result<(), AppError> {
+async fn process_ffmpeg_line(line: &str, ctx: ProgressContext<'_>) -> Result<(), AppError> {
     if line.is_empty() {
         return Ok(());
     }
 
-    tracing::debug!(operation = %operation, message = %line, "ffmpeg stderr");
+    tracing::debug!(operation = %ctx.operation, message = %line, "ffmpeg stderr");
 
     if let Some(metrics) = parse_ffmpeg_metrics(line) {
-        let ratio = (metrics.time_seconds / total_seconds).clamp(0.0, 1.0) as f32;
-        if ratio < *last_reported {
+        let ratio = (metrics.time_seconds / ctx.total_seconds).clamp(0.0, 1.0) as f32;
+        if ratio < *ctx.last_reported {
             return Ok(());
         }
 
-        let delta = ratio - *last_reported;
+        let delta = ratio - *ctx.last_reported;
         let now = Instant::now();
 
         if delta >= PROGRESS_EPSILON
-            || now.duration_since(*last_update) >= MAX_PROGRESS_UPDATE_INTERVAL
+            || now.duration_since(*ctx.last_update) >= MAX_PROGRESS_UPDATE_INTERVAL
         {
-            jobs.update_progress(job_id, ratio).await?;
-            *last_reported = ratio;
-            *last_update = now;
+            ctx.jobs.update_progress(ctx.job_id, ratio).await?;
+            *ctx.last_reported = ratio;
+            *ctx.last_update = now;
         }
 
-        if now.duration_since(*last_log) >= PROGRESS_LOG_INTERVAL
+        if now.duration_since(*ctx.last_log) >= PROGRESS_LOG_INTERVAL
             || (1.0 - ratio) <= PROGRESS_EPSILON
         {
             if let Some(speed) = metrics.speed {
                 let eta_seconds = if speed > 0.0 {
-                    (total_seconds - metrics.time_seconds).max(0.0) / speed
+                    (ctx.total_seconds - metrics.time_seconds).max(0.0) / speed
                 } else {
                     f64::INFINITY
                 };
                 let eta_str = format_eta(eta_seconds);
                 tracing::info!(
-                    operation = %operation,
+                    operation = %ctx.operation,
                     progress_percent = (ratio * 100.0).clamp(0.0, 100.0),
                     speed = speed,
                     eta = %eta_str,
@@ -857,12 +866,12 @@ async fn process_ffmpeg_line(
                 );
             } else {
                 tracing::info!(
-                    operation = %operation,
+                    operation = %ctx.operation,
                     progress_percent = (ratio * 100.0).clamp(0.0, 100.0),
                     "ffmpeg progress"
                 );
             }
-            *last_log = now;
+            *ctx.last_log = now;
         }
     }
 
@@ -890,9 +899,7 @@ where
 {
     let start = text.find(needle)? + needle.len();
     let remainder = &text[start..];
-    let end = remainder
-        .find(|ch| !allowed(ch))
-        .unwrap_or_else(|| remainder.len());
+    let end = remainder.find(|ch| !allowed(ch)).unwrap_or(remainder.len());
     let value = &remainder[..end];
     if value.is_empty() { None } else { Some(value) }
 }
@@ -917,7 +924,7 @@ fn parse_speed(value: &str) -> Option<f64> {
         return None;
     }
 
-    let numeric = trimmed.trim_end_matches(|c| c == 'x' || c == 'X');
+    let numeric = trimmed.trim_end_matches(['x', 'X']);
     let parsed = numeric.parse::<f64>().ok()?;
     if parsed.is_finite() && parsed > 0.0 {
         Some(parsed)
