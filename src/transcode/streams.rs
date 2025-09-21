@@ -235,7 +235,17 @@ pub(crate) async fn generate_hls_stream(
         os_path(&variant_index),
     ]);
 
-    run_ffmpeg(args).await
+    run_ffmpeg(args).await?;
+
+    let index_playlist = hls_dir.join("index.m3u8");
+    if !index_playlist.exists() {
+        return Err(AppError::transcode("ffmpeg did not produce an HLS master playlist"));
+    }
+
+    let master_playlist = hls_dir.join("master.m3u8");
+    fs::copy(&index_playlist, &master_playlist).await?;
+
+    Ok(())
 }
 
 pub(crate) async fn generate_dash_stream(

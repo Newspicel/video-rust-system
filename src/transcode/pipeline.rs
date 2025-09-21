@@ -132,8 +132,13 @@ pub async fn ensure_hls_ready(storage: &Storage, id: &Uuid) -> Result<(), AppErr
         )));
     }
 
-    let index = storage.hls_dir(id).join("index.m3u8");
+    let hls_dir = storage.hls_dir(id);
+    let index = hls_dir.join("index.m3u8");
     if index.exists() {
+        let master = hls_dir.join("master.m3u8");
+        if !master.exists() {
+            fs::copy(&index, &master).await?;
+        }
         return Ok(());
     }
 

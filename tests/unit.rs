@@ -8,3 +8,5 @@ mod handlers;
 mod jobs;
 #[path = "unit/storage.rs"]
 mod storage;
+#[path = "unit/transcode.rs"]
+mod transcode;
