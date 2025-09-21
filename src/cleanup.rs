@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::{
     error::AppError,
     jobs::{DynJobStore, JobStage},
-    storage::Storage,
+    storage::{Storage, ensure_dir},
 };
 
 #[derive(Debug, Clone)]
@@ -100,9 +100,20 @@ pub async fn ensure_capacity(
 
 async fn needs_cleanup(storage: &Storage, config: &CleanupConfig) -> Result<bool, AppError> {
     let root = storage.root_dir();
-    let status = task::spawn_blocking(move || disk_status(&root))
-        .await
-        .map_err(|err| AppError::dependency(format!("cleanup blocking task failed: {err}")))??;
+    let status = match task::spawn_blocking({
+        let path = root.clone();
+        move || disk_status(&path)
+    })
+    .await
+    .map_err(|err| AppError::dependency(format!("cleanup blocking task failed: {err}")))?
+    {
+        Ok(status) => status,
+        Err(AppError::Io(io_err)) if io_err.kind() == std::io::ErrorKind::NotFound => {
+            ensure_dir(root.as_path()).await?;
+            return Ok(false);
+        }
+        Err(other) => return Err(other),
+    };
 
     let free_ratio = if status.total_bytes > 0 {
         status.free_bytes as f32 / status.total_bytes as f32
