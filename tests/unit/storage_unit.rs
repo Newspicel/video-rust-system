@@ -54,3 +54,14 @@ async fn prune_transcodes_removes_variant_dirs() -> Result<(), AppError> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn prune_transcodes_noop_when_missing() -> Result<(), AppError> {
+    let temp = tempdir().expect("tempdir");
+    let storage = Storage::initialize(temp.path()).await?;
+    let id = Uuid::new_v4();
+
+    assert!(!storage.prune_transcodes(&id).await?);
+
+    Ok(())
+}
