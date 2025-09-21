@@ -19,6 +19,7 @@ async fn initialize_sets_up_directories() -> Result<(), AppError> {
 
     let video_dir = storage.video_dir(&id);
     assert!(video_dir.starts_with(temp.path()));
+    assert_eq!(video_dir.parent(), Some(temp.path()));
 
     let download = storage.download_path(&id);
     assert!(download.ends_with("download.webm"));
@@ -30,8 +31,6 @@ async fn initialize_sets_up_directories() -> Result<(), AppError> {
 
     let incoming_root = tmp_root.join("incoming");
     assert!(incoming.starts_with(&incoming_root));
-
-    assert!(storage.libs_dir().exists());
 
     Ok(())
 }

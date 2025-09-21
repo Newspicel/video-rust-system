@@ -15,8 +15,6 @@ pub struct Storage {
 
 struct StorageInner {
     root_dir: PathBuf,
-    videos_dir: PathBuf,
-    libs_dir: PathBuf,
     tmp_root: PathBuf,
     tmp_incoming_dir: PathBuf,
     tmp_hls_dir: PathBuf,
@@ -26,15 +24,12 @@ struct StorageInner {
 impl Storage {
     pub async fn initialize(root: impl AsRef<Path>) -> Result<Self, AppError> {
         let root = root.as_ref().to_path_buf();
-        let videos_dir = root.join("videos");
-        let libs_dir = root.join("libs");
         let tmp_root = env::temp_dir().join("vrs");
         let tmp_incoming_dir = tmp_root.join("incoming");
         let tmp_hls_dir = tmp_root.join("hls");
         let tmp_dash_dir = tmp_root.join("dash");
 
-        ensure_dir(&videos_dir).await?;
-        ensure_dir(&libs_dir).await?;
+        ensure_dir(&root).await?;
         ensure_dir(&tmp_root).await?;
         ensure_dir(&tmp_incoming_dir).await?;
         ensure_dir(&tmp_hls_dir).await?;
@@ -43,8 +38,6 @@ impl Storage {
         Ok(Self {
             inner: Arc::new(StorageInner {
                 root_dir: root,
-                videos_dir,
-                libs_dir,
                 tmp_root,
                 tmp_incoming_dir,
                 tmp_hls_dir,
@@ -60,7 +53,7 @@ impl Storage {
     }
 
     pub fn video_dir(&self, id: &uuid::Uuid) -> PathBuf {
-        self.inner.videos_dir.join(id.hyphenated().to_string())
+        self.inner.root_dir.join(id.hyphenated().to_string())
     }
 
     pub fn download_path(&self, id: &uuid::Uuid) -> PathBuf {
@@ -77,10 +70,6 @@ impl Storage {
 
     pub fn tmp_dir(&self) -> PathBuf {
         self.inner.tmp_root.clone()
-    }
-
-    pub fn libs_dir(&self) -> PathBuf {
-        self.inner.libs_dir.clone()
     }
 
     pub fn root_dir(&self) -> PathBuf {

@@ -10,14 +10,13 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command as TokioCommand;
 use url::ParseError;
 use uuid::Uuid;
-use yt_dlp::{Youtube, fetcher::deps::Libraries};
 
 use crate::{
     cleanup,
     error::AppError,
     jobs::JobStage,
     state::AppState,
-    storage::{ensure_dir, ensure_parent},
+    storage::ensure_parent,
     transcode::{EncodeParams, process_video},
 };
 
@@ -167,17 +166,7 @@ async fn run_ytdlp_pipeline(
     ensure_parent(&temp_path).await?;
     tracing::debug!(%id, %url, path = %temp_path.display(), "yt-dlp download starting");
 
-    let fetcher = prepare_ytdlp_fetcher(&state).await?;
-
-    let file_name = temp_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| AppError::transcode("temporary file path missing file name"))?;
-
-    let downloaded_path = fetcher
-        .download_video_from_url(url.clone(), file_name)
-        .await
-        .map_err(|err| AppError::dependency(format!("yt-dlp download failed: {err}")))?;
+    let downloaded_path = download_with_ytdlp_cli(&url, &temp_path).await?;
 
     if downloaded_path != temp_path {
         fs::rename(&downloaded_path, &temp_path).await?;
@@ -201,28 +190,66 @@ async fn run_ytdlp_pipeline(
     Ok(())
 }
 
-async fn prepare_ytdlp_fetcher(state: &AppState) -> Result<Youtube, AppError> {
-    let libs_dir = state.storage.libs_dir();
-    ensure_dir(libs_dir.as_path()).await?;
-    let output_dir: PathBuf = state.storage.tmp_dir();
+async fn download_with_ytdlp_cli(url: &str, destination: &Path) -> Result<PathBuf, AppError> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| AppError::transcode("temporary destination missing parent directory"))?;
 
-    let youtube_path = libs_dir.join(binary_name("yt-dlp"));
-    let ffmpeg_path = libs_dir.join(binary_name("ffmpeg"));
+    let template_path = destination.with_extension("%(ext)s");
 
-    if youtube_path.exists() && ffmpeg_path.exists() {
-        let libraries = Libraries::new(youtube_path, ffmpeg_path);
-        match Youtube::new(libraries, output_dir.clone()) {
-            Ok(fetcher) => return Ok(fetcher),
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    "failed to initialize existing yt-dlp binaries, reinstalling"
-                );
-            }
-        }
+    let output = TokioCommand::new("yt-dlp")
+        .arg("--ignore-config")
+        .arg("--no-warnings")
+        .arg("--quiet")
+        .arg("--no-progress")
+        .arg("--no-playlist")
+        .arg("--no-part")
+        .arg("--no-write-comments")
+        .arg("--no-write-subs")
+        .arg("--no-write-description")
+        .arg("--no-write-info-json")
+        .arg("--output")
+        .arg(&template_path)
+        .arg("--print")
+        .arg("after_move:filepath")
+        .arg("-f")
+        .arg("bv*+ba/b")
+        .arg(url)
+        .output()
+        .await
+        .map_err(|err| map_spawn_error(err, "yt-dlp"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AppError::dependency(format!(
+            "yt-dlp exited with status {}: {}",
+            output.status,
+            stderr.trim()
+        )));
     }
 
-    install_ytdlp_binaries(libs_dir, output_dir).await
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let reported_path = stdout
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .ok_or_else(|| AppError::dependency("yt-dlp did not report an output file"))?
+        .trim()
+        .to_string();
+
+    let mut resolved = PathBuf::from(&reported_path);
+    if resolved.is_relative() {
+        resolved = parent.join(resolved);
+    }
+
+    if !resolved.exists() {
+        return Err(AppError::dependency(format!(
+            "yt-dlp reported output {}, but file is missing",
+            resolved.display()
+        )));
+    }
+
+    Ok(resolved)
 }
 
 async fn download_with_aria2(source: &str, destination: &Path) -> Result<(), AppError> {
@@ -323,26 +350,4 @@ fn map_spawn_error(err: std::io::Error, tool: &str) -> AppError {
         _ => AppError::dependency(format!("failed to spawn {tool}: {err}")),
     }
 }
-
-fn binary_name(base: &str) -> String {
-    if cfg!(target_os = "windows") {
-        format!("{base}.exe")
-    } else {
-        base.to_string()
-    }
-}
-
-async fn install_ytdlp_binaries(
-    libs_dir: PathBuf,
-    output_dir: PathBuf,
-) -> Result<Youtube, AppError> {
-    let handle = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || {
-        handle.block_on(async move { Youtube::with_new_binaries(libs_dir, output_dir).await })
-    })
-    .await
-    .map_err(|err| AppError::dependency(format!("yt-dlp installer task panicked: {err}")))?
-    .map_err(|err| AppError::dependency(format!("failed to install yt-dlp binaries: {err}")))
-}
-
 // Tests for this module live under `tests/` to keep source files focused.
