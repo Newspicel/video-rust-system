@@ -9,8 +9,13 @@
 ## Build, Test, and Development Commands
 - `cargo run` – compile in debug mode and execute the binary for quick feedback.
 - `cargo build --release` – emit an optimized binary under `target/release/` for benchmarking or deployment.
-- `cargo test` – execute unit and integration tests; use `cargo test -- --nocapture` when diagnosing logs.
-- `cargo fmt` / `cargo clippy --all-targets --all-features` – enforce formatting and linting before review.
+- `cargo fmt` – run before every commit; CI enforces formatting via `cargo fmt -- --check`.
+- `cargo clippy --all-targets --all-features -- -D warnings` – keep the codebase lint-clean; CI treats all warnings as errors.
+- `cargo test --lib` & `cargo test --test api` – unit suites that must pass locally before pushing; GitHub Actions executes both on every push/PR.
+- `cargo test` – convenience wrapper that runs the entire test suite (unit + API).
+
+### Continuous Integration
+- GitHub Actions workflow lives in `.github/workflows/ci.yml`; it runs `cargo fmt --check`, full clippy, and the unit/API tests on each push and pull request.
 
 ## Coding Style & Naming Conventions
 - Follow Rust 2021 edition defaults: 4-space indentation, snake_case for functions/variables, UpperCamelCase for types, SCREAMING_SNAKE_CASE for constants.
@@ -25,4 +30,4 @@
 ## Commit & Pull Request Guidelines
 - Use Conventional Commits (`feat:`, `fix:`, `chore:`, etc.) to clarify intent, e.g., `feat: add geometry solver module`.
 - Reference tracking issues with `Closes #<id>` in the PR body. Include reproduction steps or screenshots for user-facing changes.
-- Ensure CI passes (`cargo fmt`, `cargo clippy`, `cargo test`) before requesting review; link to any follow-up tasks that remain.
+- Run `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --lib && cargo test --test api` locally before opening a PR; CI enforces this pipeline.
