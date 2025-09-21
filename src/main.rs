@@ -4,6 +4,7 @@ use axum::{
     Router,
     routing::{get, post},
 };
+use tower_http::cors::CorsLayer;
 use vrs::{
     cleanup::CleanupConfig,
     handlers,
@@ -33,6 +34,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cleanup,
     };
 
+    let cors = CorsLayer::permissive();
+
     let app = Router::new()
         .route("/healthz", get(health))
         .route("/upload/multipart", post(handlers::upload_multipart))
@@ -43,7 +46,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/videos/{id}/hls/{*asset}", get(handlers::get_hls_asset))
         .route("/videos/{id}/dash/{*asset}", get(handlers::get_dash_asset))
         .route("/jobs/{id}", get(handlers::job_status))
-        .with_state(state);
+        .with_state(state)
+        .layer(cors);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "video server listening");

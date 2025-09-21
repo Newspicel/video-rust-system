@@ -38,6 +38,8 @@ async fn build_state(root: &std::path::Path) -> AppState {
 }
 
 fn build_app(state: AppState) -> Router {
+    let cors = tower_http::cors::CorsLayer::permissive();
+
     Router::new()
         .route("/healthz", axum::routing::get(health))
         .route(
@@ -67,6 +69,7 @@ fn build_app(state: AppState) -> Router {
         )
         .route("/jobs/{id}", axum::routing::get(handlers::job_status))
         .with_state(state)
+        .layer(cors)
 }
 
 async fn health() -> &'static str {
@@ -83,6 +86,7 @@ async fn health_endpoint_returns_ok() {
         .oneshot(
             Request::builder()
                 .uri("/healthz")
+                .header(axum::http::header::ORIGIN, "https://example.com")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -90,8 +94,18 @@ async fn health_endpoint_returns_ok() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+    let cors = response
+        .headers()
+        .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+        .cloned();
     let body = to_bytes(response.into_body(), BODY_LIMIT).await.unwrap();
     assert_eq!(body.as_ref(), b"ok");
+
+    // CORS header should be present for any origin
+    assert_eq!(
+        cors.as_ref().and_then(|value| value.to_str().ok()),
+        Some("*")
+    );
 }
 
 #[tokio::test]
