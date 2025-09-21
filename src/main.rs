@@ -1,13 +1,20 @@
-use std::{env, net::SocketAddr, sync::Arc};
+use std::{
+    convert::Infallible,
+    env,
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use axum::{
     Router,
     http::Request,
+    response::Response as AxumResponse,
     routing::{get, post},
 };
+use tower::{Service, layer::Layer};
 use tower_http::cors::CorsLayer;
-use tower_http::trace::{DefaultOnRequest, DefaultOnResponse, TraceLayer};
-use tracing::Level;
 use vrs::{
     cleanup::CleanupConfig,
     handlers,
@@ -38,19 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let cors = CorsLayer::permissive();
-
-    let trace_layer = TraceLayer::new_for_http()
-        .make_span_with(|request: &Request<_>| {
-            tracing::span!(
-                Level::DEBUG,
-                "http_request",
-                method = %request.method(),
-                uri = %request.uri(),
-                version = ?request.version()
-            )
-        })
-        .on_request(DefaultOnRequest::new().level(Level::DEBUG))
-        .on_response(DefaultOnResponse::new().level(Level::DEBUG));
+    let request_logger = RequestLoggerLayer::default();
 
     let app = Router::new()
         .route("/healthz", get(health))
@@ -64,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/jobs/{id}", get(handlers::job_status))
         .with_state(state)
         .layer(cors)
-        .layer(trace_layer);
+        .layer(request_logger);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "video server listening");
@@ -94,5 +89,54 @@ fn setup_tracing() {
 
     if init_result.is_ok() {
         tracing::debug!(current_filter = %env_filter, "tracing initialized");
+    }
+}
+
+#[derive(Clone, Default)]
+struct RequestLoggerLayer;
+
+impl<S> Layer<S> for RequestLoggerLayer {
+    type Service = RequestLogger<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        RequestLogger { inner }
+    }
+}
+
+#[derive(Clone)]
+struct RequestLogger<S> {
+    inner: S,
+}
+
+impl<S, Body> Service<Request<Body>> for RequestLogger<S>
+where
+    S: Service<Request<Body>, Response = AxumResponse, Error = Infallible> + Send + 'static,
+    S::Future: Send + 'static,
+    Body: Send + 'static,
+{
+    type Response = AxumResponse;
+    type Error = Infallible;
+    type Future =
+        Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: Request<Body>) -> Self::Future {
+        let method = request.method().as_str().to_owned();
+        let target = request
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.as_str().to_owned())
+            .unwrap_or_else(|| request.uri().path().to_owned());
+        let fut = self.inner.call(request);
+
+        Box::pin(async move {
+            let response = fut.await?;
+            let status = response.status().as_u16();
+            tracing::debug!("{} {} {}", status, method, target);
+            Ok(response)
+        })
     }
 }
