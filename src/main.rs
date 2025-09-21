@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let cors = CorsLayer::permissive();
-    let request_logger = RequestLoggerLayer::default();
+    let request_logger = RequestLoggerLayer;
 
     let app = Router::new()
         .route("/healthz", get(health))
