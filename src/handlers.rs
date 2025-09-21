@@ -587,6 +587,10 @@ async fn download_with_aria2(source: &str, destination: &Path) -> Result<(), App
         .arg("--auto-file-renaming=false")
         .arg("--summary-interval=0")
         .arg("--seed-time=0")
+        .arg("--bt-seed-until=0")
+        .arg("--bt-stop-timeout=0")
+        .arg("--bt-remove-unselected-file=true")
+        .arg("--bt-save-metadata=false")
         .arg("--dir")
         .arg(parent);
 

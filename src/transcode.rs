@@ -92,7 +92,17 @@ pub async fn process_video(
         }
     };
 
-    encode_download(jobs, id, &download_path, input, has_audio, duration, params).await?;
+    let tmp_output = storage
+        .tmp_dir()
+        .join(format!("{}.encode.webm", id.simple()));
+    ensure_parent(&tmp_output).await?;
+    if tmp_output.exists() {
+        fs::remove_file(&tmp_output).await.ok();
+    }
+
+    encode_download(jobs, id, &tmp_output, input, has_audio, duration, params).await?;
+
+    finalize_encoded_file(&tmp_output, &download_path).await?;
 
     match fs::remove_file(input).await {
         Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
@@ -223,6 +233,24 @@ async fn encode_download(
     }
 
     Err(last_error.unwrap_or_else(|| AppError::transcode("encode pipeline failed")))
+}
+
+async fn finalize_encoded_file(temp: &Path, final_path: &Path) -> Result<(), AppError> {
+    ensure_parent(final_path).await?;
+
+    if final_path.exists() {
+        fs::remove_file(final_path).await.ok();
+    }
+
+    match fs::rename(temp, final_path).await {
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::CrossesDevices => {
+            fs::copy(temp, final_path).await.map_err(AppError::from)?;
+            fs::remove_file(temp).await.ok();
+            Ok(())
+        }
+        Err(err) => Err(err.into()),
+    }
 }
 
 fn base_encode_args(input: &Path) -> Vec<OsString> {
@@ -892,5 +920,17 @@ mod tests {
     fn parse_speed_handles_cases() {
         assert_eq!(parse_speed("2.5x"), Some(2.5));
         assert!(parse_speed("N/A").is_none());
+    }
+
+    #[tokio::test]
+    async fn finalize_encoded_file_renames() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join("temp.webm");
+        let final_path = dir.path().join("final.webm");
+        tokio::fs::write(&temp, b"data").await.unwrap();
+
+        finalize_encoded_file(&temp, &final_path).await.unwrap();
+        assert!(!temp.exists());
+        assert!(final_path.exists());
     }
 }
